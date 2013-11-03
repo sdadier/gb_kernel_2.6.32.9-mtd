@@ -1,0 +1,4386 @@
+Seulement dans .: alldiff.txt
+Seulement dans ./arch/arm/boot/compressed: Makefile~
+Seulement dans ./arch/arm/configs: galaxy3_defconfig
+Seulement dans ./arch/arm/include/asm: rwsem.h
+diff -r ./arch/arm/include/asm/spinlock.h ../../Kernel/arch/arm/include/asm/spinlock.h
+8,22d7
+< #include <asm/processor.h>
+< 
+< /*
+<  * sev and wfe are ARMv6K extensions.  Uniprocessor ARMv6 may not have the K
+<  * extensions, so when running on UP, we have to patch these instructions away.
+<  */
+< #define ALT_SMP(smp, up)					\
+< 	"9998:	" smp "\n"					\
+< 	"	.pushsection \".alt.smp.init\", \"a\"\n"	\
+< 	"	.long	9998b\n"				\
+< 	"	" up "\n"					\
+< 	"	.popsection\n"
+< 
+< #ifdef CONFIG_THUMB2_KERNEL
+< #define SEV		ALT_SMP("sev.w", "nop.w")
+24,28c9
+<  * For Thumb-2, special care is needed to ensure that the conditional WFE
+<  * instruction really does assemble to exactly 4 bytes (as required by
+<  * the SMP_ON_UP fixup code).   By itself "wfene" might cause the
+<  * assembler to insert a extra (16-bit) IT instruction, depending on the
+<  * presence or absence of neighbouring conditional instructions.
+---
+>  * ARMv6 Spin-locking.
+30,62c11,14
+<  * To avoid this unpredictableness, an approprite IT is inserted explicitly:
+<  * the assembler won't change IT instructions which are explicitly present
+<  * in the input.
+<  */
+< #define WFE(cond)	ALT_SMP(		\
+< 	"it " cond "\n\t"			\
+< 	"wfe" cond ".n",			\
+< 						\
+< 	"nop.w"					\
+< )
+< #else
+< #define SEV		ALT_SMP("sev", "nop")
+< #define WFE(cond)	ALT_SMP("wfe" cond, "nop")
+< #endif
+< 
+< static inline void dsb_sev(void)
+< {
+< #if __LINUX_ARM_ARCH__ >= 7
+< 	__asm__ __volatile__ (
+< 		"dsb\n"
+< 		SEV
+< 	);
+< #else
+< 	__asm__ __volatile__ (
+< 		"mcr p15, 0, %0, c7, c10, 4\n"
+< 		SEV
+< 		: : "r" (0)
+< 	);
+< #endif
+< }
+< 
+< /*
+<  * ARMv6 ticket-based spin-locking.
+---
+>  * We exclusively read the old value.  If it is zero, we may have
+>  * won the lock, so we try exclusively storing it.  A memory barrier
+>  * is required after we get a lock, and before we release it, because
+>  * V6 CPUs are assumed to have weakly ordered memory.
+64,66c16,17
+<  * A memory barrier is required after we get a lock, and before we
+<  * release it, because V6 CPUs are assumed to have weakly ordered
+<  * memory.
+---
+>  * Unlocked value: 0
+>  * Locked value: 1
+69,70c20,22
+< #define arch_spin_unlock_wait(lock) \
+< 	do { while (arch_spin_is_locked(lock)) cpu_relax(); } while (0)
+---
+> #define __raw_spin_is_locked(x)		((x)->lock != 0)
+> #define __raw_spin_unlock_wait(lock) \
+> 	do { while (__raw_spin_is_locked(lock)) cpu_relax(); } while (0)
+72c24
+< #define arch_spin_lock_flags(lock, flags) arch_spin_lock(lock)
+---
+> #define __raw_spin_lock_flags(lock, flags) __raw_spin_lock(lock)
+74c26
+< static inline void arch_spin_lock(arch_spinlock_t *lock)
+---
+> static inline void __raw_spin_lock(raw_spinlock_t *lock)
+77,78d28
+< 	u32 newval;
+< 	arch_spinlock_t lockval;
+81,84c31,37
+< "1:	ldrex	%0, [%3]\n"
+< "	add	%1, %0, %4\n"
+< "	strex	%2, %1, [%3]\n"
+< "	teq	%2, #0\n"
+---
+> "1:	ldrex	%0, [%1]\n"
+> "	teq	%0, #0\n"
+> #ifdef CONFIG_CPU_32v6K
+> "	wfene\n"
+> #endif
+> "	strexeq	%0, %2, [%1]\n"
+> "	teqeq	%0, #0\n"
+86,87c39,40
+< 	: "=&r" (lockval), "=&r" (newval), "=&r" (tmp)
+< 	: "r" (&lock->slock), "I" (1 << TICKET_SHIFT)
+---
+> 	: "=&r" (tmp)
+> 	: "r" (&lock->lock), "r" (1)
+90,94d42
+< 	while (lockval.tickets.next != lockval.tickets.owner) {
+< 		wfe();
+< 		lockval.tickets.owner = ACCESS_ONCE(lock->tickets.owner);
+< 	}
+< 
+98c46
+< static inline int arch_spin_trylock(arch_spinlock_t *lock)
+---
+> static inline int __raw_spin_trylock(raw_spinlock_t *lock)
+101d48
+< 	u32 slock;
+104,110c51,55
+< "	ldrex	%0, [%2]\n"
+< "	cmp	%0, %0, ror #16\n"
+< "	movne	%1, #1\n"
+< "	addeq	%0, %0, %3\n"
+< "	strexeq	%1, %0, [%2]"
+< 	: "=&r" (slock), "=&r" (tmp)
+< 	: "r" (&lock->slock), "I" (1 << TICKET_SHIFT)
+---
+> "	ldrex	%0, [%1]\n"
+> "	teq	%0, #0\n"
+> "	strexeq	%0, %2, [%1]"
+> 	: "=&r" (tmp)
+> 	: "r" (&lock->lock), "r" (1)
+121c66
+< static inline void arch_spin_unlock(arch_spinlock_t *lock)
+---
+> static inline void __raw_spin_unlock(raw_spinlock_t *lock)
+123,125d67
+< 	unsigned long tmp;
+< 	u32 slock;
+< 
+129,136c71,77
+< "	mov	%1, #1\n"
+< "1:	ldrex	%0, [%2]\n"
+< "	uadd16	%0, %0, %1\n"
+< "	strex	%1, %0, [%2]\n"
+< "	teq	%1, #0\n"
+< "	bne	1b"
+< 	: "=&r" (slock), "=&r" (tmp)
+< 	: "r" (&lock->slock)
+---
+> "	str	%1, [%0]\n"
+> #ifdef CONFIG_CPU_32v6K
+> "	mcr	p15, 0, %1, c7, c10, 4\n" /* DSB */
+> "	sev"
+> #endif
+> 	:
+> 	: "r" (&lock->lock), "r" (0)
+138,151d78
+< 
+< 	dsb_sev();
+< }
+< 
+< static inline int arch_spin_is_locked(arch_spinlock_t *lock)
+< {
+< 	struct __raw_tickets tickets = ACCESS_ONCE(lock->tickets);
+< 	return tickets.owner != tickets.next;
+< }
+< 
+< static inline int arch_spin_is_contended(arch_spinlock_t *lock)
+< {
+< 	struct __raw_tickets tickets = ACCESS_ONCE(lock->tickets);
+< 	return (tickets.next - tickets.owner) > 1;
+153d79
+< #define arch_spin_is_contended	arch_spin_is_contended
+163c89
+< static inline void arch_write_lock(arch_rwlock_t *rw)
+---
+> static inline void __raw_write_lock(raw_rwlock_t *rw)
+170c96,98
+< 	WFE("ne")
+---
+> #ifdef CONFIG_CPU_32v6K
+> "	wfene\n"
+> #endif
+181c109
+< static inline int arch_write_trylock(arch_rwlock_t *rw)
+---
+> static inline int __raw_write_trylock(raw_rwlock_t *rw)
+201c129
+< static inline void arch_write_unlock(arch_rwlock_t *rw)
+---
+> static inline void __raw_write_unlock(raw_rwlock_t *rw)
+206a135,138
+> #ifdef CONFIG_CPU_32v6K
+> "	mcr	p15, 0, %1, c7, c10, 4\n" /* DSB */
+> "	sev\n"
+> #endif
+210,211d141
+< 
+< 	dsb_sev();
+215c145
+< #define arch_write_can_lock(x)		((x)->lock == 0)
+---
+> #define __raw_write_can_lock(x)		((x)->lock == 0)
+229c159
+< static inline void arch_read_lock(arch_rwlock_t *rw)
+---
+> static inline void __raw_read_lock(raw_rwlock_t *rw)
+237c167,169
+< 	WFE("mi")
+---
+> #ifdef CONFIG_CPU_32v6K
+> "	wfemi\n"
+> #endif
+247c179
+< static inline void arch_read_unlock(arch_rwlock_t *rw)
+---
+> static inline void __raw_read_unlock(raw_rwlock_t *rw)
+258a191,195
+> #ifdef CONFIG_CPU_32v6K
+> "\n	cmp	%0, #0\n"
+> "	mcreq   p15, 0, %0, c7, c10, 4\n"
+> "	seveq"
+> #endif
+262,264d198
+< 
+< 	if (tmp == 0)
+< 		dsb_sev();
+267c201
+< static inline int arch_read_trylock(arch_rwlock_t *rw)
+---
+> static inline int __raw_read_trylock(raw_rwlock_t *rw)
+284c218
+< #define arch_read_can_lock(x)		((x)->lock < 0x80000000)
+---
+> #define __raw_read_can_lock(x)		((x)->lock < 0x80000000)
+286,287c220,221
+< #define arch_read_lock_flags(lock, flags) arch_read_lock(lock)
+< #define arch_write_lock_flags(lock, flags) arch_write_lock(lock)
+---
+> #define __raw_read_lock_flags(lock, flags) __raw_read_lock(lock)
+> #define __raw_write_lock_flags(lock, flags) __raw_write_lock(lock)
+289,291c223,225
+< #define arch_spin_relax(lock)	cpu_relax()
+< #define arch_read_relax(lock)	cpu_relax()
+< #define arch_write_relax(lock)	cpu_relax()
+---
+> #define _raw_spin_relax(lock)	cpu_relax()
+> #define _raw_read_relax(lock)	cpu_relax()
+> #define _raw_write_relax(lock)	cpu_relax()
+294d227
+< 
+diff -r ./arch/arm/Kconfig ../../Kernel/arch/arm/Kconfig
+118,119c118
+<         default y
+<         def_bool y
+---
+> 	default y
+Seulement dans ./arch/arm: Kconfig~
+diff -r ./arch/arm/mach-s5p6442/apollo-rfkill.c ../../Kernel/arch/arm/mach-s5p6442/apollo-rfkill.c
+229c229
+< 	enable_irq(IRQ_BT_HOST_WAKE);
+---
+> //	enable_irq(IRQ_BT_HOST_WAKE);
+232c232
+< 	rfkill_switch_all(RFKILL_TYPE_BLUETOOTH, RFKILL_USER_STATE_SOFT_BLOCKED);
+---
+> 	//rfkill_switch_all(RFKILL_TYPE_BLUETOOTH, RFKILL_USER_STATE_SOFT_BLOCKED);
+Seulement dans ./arch/arm/mach-s5p6442: apollo-rfkill.c~
+diff -r ./arch/arm/mach-s5p6442/include/mach/map.h ../../Kernel/arch/arm/mach-s5p6442/include/mach/map.h
+95,96c95,97
+< #define S5PC110_PA_ONENAND              0xB0000000
+< #define S5PC110_PA_ONENAND_DMA          0xB0600000
+---
+> #define S5P64XX_PA_ONENAND      (0xB0600000)
+> #define S5P64XX_VA_ONENAND      S3C_VA_ONENAND
+> #define S5P64XX_SZ_ONENAND      SZ_16K
+178,179d178
+< #define S5P_PA_ONENAND                  S5PC110_PA_ONENAND
+< #define S5P_PA_ONENAND_DMA              S5PC110_PA_ONENAND_DMA
+diff -r ./arch/arm/mach-s5p6442/include/mach/param.h ../../Kernel/arch/arm/mach-s5p6442/include/mach/param.h
+52,58d51
+< #define IMAGE_LEN	(192 * 1024)	/* 192KB, size of image area in PARAM block */
+< #define PARAM_LEN	(32 * 2048)  /* 64KB */
+< 
+< #define kloge(fmt, arg...)  printk(KERN_ERR "%s(%d): " fmt "\n" , __func__, __LINE__, ## arg)
+< #define klogi(fmt, arg...)  printk(KERN_INFO fmt "\n" , ## arg)
+< 
+< 
+95d87
+<         char picture[IMAGE_LEN];
+100c92
+< } param_status_t;
+---
+> } status_t;
+Seulement dans ./arch/arm/mach-s5p6442/include/mach: s5p_leds.h
+diff -r ./arch/arm/mach-s5p6442/Kconfig ../../Kernel/arch/arm/mach-s5p6442/Kconfig
+71,90d70
+< config OC800
+< 	bool "800Mhz Edition"
+< 	depends on MACH_APOLLO
+< 	help
+< 		Provide an additional frequency step "800Mhz" without raising voltage
+< 
+< config OC1000
+< 	bool "Overclocked CPU"
+< 	depends on MACH_APOLLO
+< 	depends on OC800
+< 	help
+< 		Provide full overclocking for the CPU to 1000Mhz
+< 
+< config OCMAX
+< 	bool "Overlock CPU and BUS"
+< 	depends on MACH_APOLLO
+< 	depends on OC1000
+< 	help
+< 		Provide more overclocking for the CPU and BUS	
+< 
+Seulement dans ./arch/arm/mach-s5p6442: Kconfig~
+diff -r ./arch/arm/mach-s5p6442/mach-apollo.c ../../Kernel/arch/arm/mach-s5p6442/mach-apollo.c
+75,76d74
+< #include <mach/s5p_leds.h>
+< 
+719,731d716
+< /* LEDS */
+< static struct s5p6442_led_platdata s5p_led1_pdata = {
+< 	.name		= "button_led",
+< 	.flags		= S5P6442_LEDF_ACTLOW | S5P6442_LEDF_TRISTATE,
+< 	.def_trigger	= "none",
+< };
+< 
+< static struct platform_device  s5p_led1 = {
+< 	.name		= "s5p6442_led",
+< 	.id		= 1,
+< 	.dev.platform_data	= &s5p_led1_pdata,
+< };
+< 
+816c801
+<         .udelay                 = 1,           /*250KHz*/
+---
+>         .udelay                 = 2,           /*250KHz*/
+844,847c829,832
+< //struct platform_device sec_device_proximity = {
+< //        .name   = "proximity_cm3607",
+< //        .id     = -1,
+< //};
+---
+> struct platform_device sec_device_proximity = {
+>         .name   = "proximity_cm3607",
+>         .id     = -1,
+> };
+961a947
+> 
+963,964c949
+<         &s5p_device_onenand,
+< //        &apollo_bml_device,
+---
+>         &s3c_device_onenand,
+965a951
+> 
+1028c1014
+< #if defined CONFIG_VIDEO_G3D || defined CONFIG_VIDEO_OPENFIMG
+---
+> #if defined CONFIG_VIDEO_G3D
+1042c1028
+< //	&sec_device_proximity,
+---
+> 	&sec_device_proximity,
+1047c1033
+<         &s5p_led1,
+---
+> 
+1638c1624,1626
+< 
+---
+> #ifdef CONFIG_MTD_ONENAND
+>         s3c_device_onenand.name = "s5p6442-onenand";
+> #endif
+Seulement dans ./arch/arm/mach-s5p6442: mach-apollo.c~
+diff -r ./arch/arm/plat-s5p/include/plat/devs.h ../../Kernel/arch/arm/plat-s5p/include/plat/devs.h
+60,61c60
+< extern struct platform_device s5p_device_onenand;
+< extern struct platform_device apollo_bml_device;
+---
+> extern struct platform_device s3c_device_onenand;
+Seulement dans ./arch/arm/plat-s5p64xx: changefreq-800.S
+Seulement dans ./arch/arm/plat-s5p64xx: changefreq-oc.S
+Seulement dans ./arch/arm/plat-s5p64xx: clock-800.c
+Seulement dans ./arch/arm/plat-s5p64xx: clock-oc.c
+Seulement dans ./arch/arm/plat-s5p64xx: dev-bml.c
+Seulement dans ./arch/arm/plat-s5p64xx: dev-onenand.c
+diff -r ./arch/arm/plat-s5p64xx/devs.c ../../Kernel/arch/arm/plat-s5p64xx/devs.c
+523a524,543
+> /* OneNAND Controller */
+> static struct resource s3c_onenand_resource[] = {
+>         [0] = {
+>                 .start = S5P64XX_PA_ONENAND,
+>                 .end   = S5P64XX_PA_ONENAND + S5P64XX_SZ_ONENAND - 1,
+>                 .flags = IORESOURCE_MEM,
+>         }
+> };
+> 
+> struct platform_device s3c_device_onenand = {
+>         .name           = "onenand",
+>         .id             = -1,
+>         .num_resources  = ARRAY_SIZE(s3c_onenand_resource),
+>         .resource       = s3c_onenand_resource,
+> };
+> 
+> EXPORT_SYMBOL(s3c_device_onenand);
+> 
+> 
+> 
+532d551
+< #ifdef CONFIG_VIDEO_G3D
+534d552
+< #endif
+diff -r ./arch/arm/plat-s5p64xx/include/plat/irqs.h ../../Kernel/arch/arm/plat-s5p64xx/include/plat/irqs.h
+106d105
+< #define IRQ_ONENAND_AUDI S5P64XX_IRQ_VIC1(7)
+diff -r ./arch/arm/plat-s5p64xx/include/plat/reserved_mem.h ../../Kernel/arch/arm/plat-s5p64xx/include/plat/reserved_mem.h
+24d23
+< #ifndef CONFIG_VIDEO_OPENFIMG
+26,29d24
+< #endif
+< #ifdef CONFIG_VIDEO_OPENFIMG
+< #define RESERVED_PMEM_GPU1		(RESERVED_MEM_G3D)
+< #endif
+48d42
+< #ifndef CONFIG_VIDEO_OPENFIMG
+50,53d43
+< #endif
+< #ifdef CONFIG_VIDEO_OPENFIMG
+< #define GPU1_RESERVED_PMEM_START	(G3D_RESERVED_MEM_START)
+< #endif
+diff -r ./arch/arm/plat-s5p64xx/include/plat/s5p6442-dvfs.h ../../Kernel/arch/arm/plat-s5p64xx/include/plat/s5p6442-dvfs.h
+13,17d12
+< 
+< extern int *FakeShmoo_UV_mV_Ptr; // Stored voltage table from cpufreq sysfs
+< int set_voltage(unsigned int freq_index, bool);
+< int s5p6442_clk_set_rate(unsigned int target_freq, unsigned int index );
+< 
+36c31
+< //extern int set_voltage(unsigned int);
+---
+> extern int set_voltage(unsigned int);
+42,53d36
+< 
+< extern unsigned int frequency_match_666_166MHz[][4];
+< 
+< #ifdef CONFIG_OC800
+< #ifndef CONFIG_OC1000
+< extern void s5p6442_preclock(void);
+< extern void s5p6442_postclock(void);
+< extern u32 s5p_cpu_pll_tab[][2];
+< #else
+< extern void s5p6442_clock800(void);
+< #endif
+< #endif
+diff -r ./arch/arm/plat-s5p64xx/Kconfig ../../Kernel/arch/arm/plat-s5p64xx/Kconfig
+84a85
+> 
+diff -r ./arch/arm/plat-s5p64xx/Makefile ../../Kernel/arch/arm/plat-s5p64xx/Makefile
+28,38d27
+< ifdef CONFIG_OC800
+< ifdef CONFIG_OC1000
+< ifdef CONFIG_OCMAX
+< obj-y				+= clock-ultra.o
+< else
+< obj-y				+= clock-oc.o
+< endif
+< else
+< obj-y				+= clock-800.o
+< endif
+< else
+40d28
+< endif
+47,63d34
+< ifdef CONFIG_OC800
+< ifdef CONFIG_OC1000
+< ifdef CONFIG_OCMAX
+< obj-$(CONFIG_CPU_S5P6442_CLOCK)	+= s5p6442-clock-ultra.o
+< obj-$(CONFIG_CPU_FREQ)         += s5p6442-dvfs-ultra.o changefreq-ultra.o
+< obj-$(CONFIG_PM)                += pm-ultra.o
+< else
+< obj-$(CONFIG_CPU_S5P6442_CLOCK)	+= s5p6442-clock-oc.o
+< obj-$(CONFIG_CPU_FREQ)         += s5p6442-dvfs-oc.o changefreq-oc.o
+< obj-$(CONFIG_PM)                += pm-oc.o
+< endif
+< else
+< obj-$(CONFIG_CPU_S5P6442_CLOCK)	+= s5p6442-clock.o
+< obj-$(CONFIG_CPU_FREQ)         += s5p6442-dvfs-800.o changefreq-800.o
+< obj-$(CONFIG_PM)                += pm-800.o
+< endif
+< else
+64a36
+> #obj-$(CONFIG_CPU_FREQ)     += s5p64xx-cpufreq.o ltc3714.o
+67d38
+< endif
+70a42
+> 
+89,91d60
+< 
+< obj-y += dev-onenand.o
+< #obj-y += dev-bml.o
+Seulement dans ./arch/arm/plat-s5p64xx: Makefile~
+Seulement dans ./arch/arm/plat-s5p64xx: pm-800.c
+Seulement dans ./arch/arm/plat-s5p64xx: pm-oc.c
+Seulement dans ./arch/arm/plat-s5p64xx: s5p6442-clock-800.c
+Seulement dans ./arch/arm/plat-s5p64xx: s5p6442-clock-oc.c
+Seulement dans ./arch/arm/plat-s5p64xx: s5p6442-dvfs-800.c
+diff -r ./arch/arm/plat-s5p64xx/s5p6442-dvfs.c ../../Kernel/arch/arm/plat-s5p64xx/s5p6442-dvfs.c
+626,630d625
+< static struct freq_attr *s5p6442_cpufreq_attr[] = {
+< 	&cpufreq_freq_attr_scaling_available_freqs,
+< 	NULL,
+< };
+< 
+638d632
+<     .attr		= s5p6442_cpufreq_attr,
+Seulement dans ./arch/arm/plat-s5p64xx: s5p6442-dvfs-oc.c
+diff -r ./block/Kconfig.iosched ../../Kernel/block/Kconfig.iosched
+43,58d42
+< config IOSCHED_VR
+< 	tristate "V(R) I/O scheduler"
+< 	---help---
+< 	  Requests are chosen according to SSTF with a penalty of rev_penalty
+< 	  for switching head direction.
+< 
+< config IOSCHED_SIO
+<         tristate "Simple I/O scheduler"
+<         default y
+<         ---help---
+<           The Simple I/O scheduler is an extremely simple scheduler,
+<           based on noop and deadline, that relies on deadlines to
+<           ensure fairness. The algorithm does not do any sorting but
+<           basic merging, trying to keep a minimum overhead. It is aimed
+<           mainly for aleatory access devices (eg: flash devices).
+< 
+72,74d55
+< 	config DEFAULT_VR
+< 		bool "VR" if IOSCHED_VR=y
+< 
+78,80d58
+<         config DEFAULT_SIO
+<                 bool "SIO" if IOSCHED_SIO=y
+< 
+92,93d69
+< 	default "sio" if DEFAULT_SIO
+<         default "vr" if DEFAULT_VR
+diff -r ./block/Makefile ../../Kernel/block/Makefile
+15,16d14
+< obj-$(CONFIG_IOSCHED_VR)        += vr-iosched.o
+< obj-$(CONFIG_IOSCHED_SIO)	+= sio-iosched.o
+Seulement dans ./block: Makefile~
+Seulement dans ./block: sio-iosched.c
+Seulement dans ./block: vr-iosched.c
+Seulement dans .: .config
+Seulement dans .: .config_20130416
+Seulement dans .: .config_nonpreempt
+Seulement dans .: .config_old
+Seulement dans .: .config.old
+Seulement dans ./drivers/cpufreq: cpufreq-800.c
+Seulement dans ./drivers/cpufreq: cpufreq_lagfree.c
+Seulement dans ./drivers/cpufreq: cpufreq-oc.c
+Seulement dans ./drivers/cpufreq: cpufreq-ultra.c
+diff -r ./drivers/cpufreq/Kconfig ../../Kernel/drivers/cpufreq/Kconfig
+72d71
+< 
+103,114d101
+< config CPU_FREQ_DEFAULT_GOV_LAGFREE
+< 	bool "lagfree"
+< 	select CPU_FREQ_GOV_LAGFREE
+< 	select CPU_FREQ_GOV_PERFORMANCE
+< 	help
+< 	  Use the CPUFreq governor 'lagfree' as default. This allows
+< 	  you to get a full dynamic frequency capable system by simply
+< 	  loading your cpufreq low-level hardware driver.
+< 	  Be aware that not all cpufreq drivers support the lagfree
+< 	  governor. If unsure have a look at the help section of the
+< 	  driver. Fallback governor will be the performance governor.
+< 
+182,199d168
+< 
+< 
+< config CPU_FREQ_GOV_LAGFREE
+<         tristate "'lagfree' cpufreq governor"
+<         depends on CPU_FREQ
+<         help
+<           'lagfree' - this driver is rather similar to the 'ondemand'
+<           governor both in its source code and its purpose, the difference is
+<           its optimisation for better suitability in a battery powered
+<           environment. The frequency is gracefully increased and decreased
+<           rather than jumping to 100% when speed is required.
+< 
+<           To compile this driver as a module, choose M here: the
+<           module will be called cpufreq_lagfree.
+< 
+<           For details, take a look at linux/Documentation/cpu-freq.
+< 
+<           If in doubt, say N.
+diff -r ./drivers/cpufreq/Makefile ../../Kernel/drivers/cpufreq/Makefile
+2,11d1
+< ifdef CONFIG_OC1000
+< ifdef CONFIG_OCMAX
+< obj-$(CONFIG_CPU_FREQ)			+= cpufreq-ultra.o
+< else
+< obj-$(CONFIG_CPU_FREQ)			+= cpufreq-oc.o
+< endif
+< else
+< ifdef CONFIG_OC800
+< obj-$(CONFIG_CPU_FREQ)			+= cpufreq-800.o
+< else
+13,14d2
+< endif
+< endif
+24d11
+< obj-$(CONFIG_CPU_FREQ_GOV_LAGFREE)      += cpufreq_lagfree.o
+Seulement dans ./drivers/cpufreq: Makefile~
+diff -r ./drivers/i2c/chips/max8998.c ../../Kernel/drivers/i2c/chips/max8998.c
+1594a1595,1624
+> #ifdef CONFIG_MACH_APOLLO
+> static void apollo_button_brightness_set(struct led_classdev *led_cdev, enum led_brightness value)
+> {
+> 	//mutex_lock(&apollo_button_backlight_lock);
+> 	if(value > 0)
+> 		{
+> 		// ON
+> 		if(TRUE != Set_MAX8998_PM_REG(ELDO17, 1) )			// VKEYLED 3.3V
+> 			{
+> 			printk("%s, error: LDO17 turn on\n", __func__);
+> 			}	
+> 		}
+> 	else
+> 		{
+> 		// OFF
+> 		if(TRUE != Set_MAX8998_PM_REG(ELDO17, 0) )			// VKEYLED 3.3V
+> 			{
+> 			printk("%s, error: LDO17 turn off\n", __func__);
+> 			}	
+> 		}
+> 	//mutex_unlock(&apollo_button_backlight_lock);
+> }
+> 
+> static struct led_classdev apollo_button_backlight_led  = {
+> 	.name		= "button-backlight",
+> 	.brightness_set = apollo_button_brightness_set,
+> };
+> #endif
+> 
+> 
+2128a2159,2164
+> #ifdef CONFIG_MACH_APOLLO
+> 	ret = led_classdev_register(&client->dev, &apollo_button_backlight_led);
+> 	if (ret < 0)
+> 		printk("%s fail: led_classdev_register\n", __func__);
+> #endif
+> 
+2135a2172,2175
+> 
+> #ifdef CONFIG_MACH_APOLLO
+> 	led_classdev_unregister(&apollo_button_backlight_led);
+> #endif
+Seulement dans ./drivers/input/touchscreen: 3356
+diff -r ./drivers/input/touchscreen/qt602240.c ../../Kernel/drivers/input/touchscreen/qt602240.c
+38c38
+< //#define DEBUG printk("[QT] %s/%d\n",__func__,__LINE__)
+---
+> #define DEBUG printk("[QT] %s/%d\n",__func__,__LINE__)
+40a41
+> #define DEBUG_CHJ 0
+42c43
+< //#define QT602240_DEBUG
+---
+> #define QT602240_DEBUG
+53c54
+< extern void set_start_check_temp_adc_for_tsp(void);
+---
+> extern void set_start_check_temp_adc_for_tsp();
+62a64,66
+> static int DELAY_TIME = 10;
+> /* CHJ Define end */
+> 
+113c117,119
+< extern int apollo_get_hw_type(void);
+---
+> extern int apollo_get_hw_type();
+> 
+> extern void s3cfb_restart_progress(void);
+653c659
+< uint16_t refer_cache[TEST_POINT_NUM];
+---
+> unsigned int refer_cache[TEST_POINT_NUM];
+656c662
+< uint16_t delta_cache[TEST_POINT_NUM];
+---
+> unsigned int delta_cache[TEST_POINT_NUM];
+757c763
+< static void (*application_message_handler)(void);
+---
+> static void (*application_message_handler)();
+761a768,770
+> /*! \brief The current address pointer. */
+> static U16 address_pointer;
+> 
+767c776
+< uint8_t init_touch_driver(uint8_t I2C_address, void (*handler)(void));
+---
+> uint8_t init_touch_driver(uint8_t I2C_address, void (*handler)());
+773,774c782,783
+< 
+< 
+---
+> void disable_changeline_int(void);
+> void enable_changeline_int(void);
+779c788
+< uint8_t get_max_report_id(void);
+---
+> uint8_t get_max_report_id();
+796c805
+< 
+---
+> U8 read_changeline(void);
+803c812
+< 
+---
+> void init_changeline(void);
+810c819
+< void read_all_register(void);
+---
+> void read_all_register();
+815a825
+> static void recalibration(void);
+834c844,846
+< static int rst_cnt[12] = { 0 };
+---
+> static dec_input tmp2 = { 0 };
+> static dec_input tmp3 = { 0 };
+> static rst_cnt[12] = { 0 };
+886c898
+< 	uint32_t crc;//, stored_crc;
+---
+> 	U32 crc;//, stored_crc;
+889a902,903
+> 	DEBUG;
+> 
+924a939,943
+> 	/* Disable interrupts from touch chip during config. We might miss initial
+> 	 *     * calibration/reset messages, but the text we are ouputting here doesn't
+> 	 *         * get cluttered with touch chip messages. */
+> 	disable_changeline_int();
+> 
+1194c1213
+< uint8_t init_touch_driver(uint8_t I2C_address, void (*handler)(void))
+---
+> uint8_t init_touch_driver(uint8_t I2C_address, void (*handler)())
+1428a1448,1451
+> 	/* Initialize the pin connected to touch ic pin CHANGELINE to catch the
+> 	 * falling edge of signal on that line. */
+> 	init_changeline();
+> 
+1722a1746,1749
+> #ifdef CONFIG_CPU_FREQ
+> 	set_dvfs_perf_level();
+> #endif
+> 
+1730,1736d1756
+<   	struct i2c_msg rmsg[2];
+< 	unsigned char data[2];
+< 
+< #ifdef CONFIG_CPU_FREQ
+< 	set_dvfs_perf_level();
+< #endif
+< 
+1748a1769
+> 	//	memset( quantum_msg ,0xFF, READ_MESSAGE_LENGTH);
+1750c1771,1772
+< 	quantum_msg[0]= 0;  // clear
+---
+> 	//	if( qt602240_i2c_read( message_processor_address, quantum_msg , READ_MESSAGE_LENGTH) <= 0 )
+> 	//		return ;
+1751a1774
+> 	quantum_msg[0]= 0;  // clear
+1752a1776,1779
+> 	/**********************************************************/	
+> #if 0
+> 	/*************** i2c read function - start ****************/	
+> 	struct i2c_msg rmsg;
+1753a1781,1811
+> 	unsigned char data[2];
+> 
+> 	rmsg.addr = qt602240->client->addr;
+> 	rmsg.flags = I2C_M_WR;
+> 	rmsg.len = 2;
+> 	rmsg.buf = data;
+> 	data[0] = message_processor_address & 0x00ff;
+> 	data[1] = message_processor_address >> 8;
+> 	size = i2c_transfer(qt602240->client->adapter, &rmsg, 1);
+> 
+> 	if( size > 0 ) {
+> 		rmsg.flags = I2C_M_RD;
+> 		rmsg.len = READ_MESSAGE_LENGTH;
+> 		rmsg.buf = quantum_msg;
+> 		size = i2c_transfer(qt602240->client->adapter, &rmsg, 1);
+> 
+> 		if ( size <= 0 )
+> 		{
+> 			printk("[TSP] Error code : %d\n", __LINE__ );
+> 			touch_hw_rst( 2 );  // TOUCH HW RESET No.2
+> 			enable_irq(qt602240->client->irq);
+> 			return ;
+> 		}
+> 	}
+> 	else
+> 	{
+> 		printk("[TSP] Error code : %d\n", __LINE__ );
+> 		touch_hw_rst( 3 );  // TOUCH HW RESET No.3
+> 		enable_irq(qt602240->client->irq);
+> 		return ;
+> 	}
+1754a1813,1818
+> 	/*************** i2c read function - end ******************/	
+> #else
+> 	/*************** i2c read function - start ****************/	
+> 	struct i2c_msg rmsg[2];
+> 	size=-1;   // size is used as result value temporarily
+> 	unsigned char data[2];
+1776a1841
+> #endif
+1780a1846,1848
+> 	#if DEBUG_CHJ
+> 		printk("[TSP] ignore event\n"); 
+> 	#endif
+1818c1886,1888
+< 
+---
+> 		#if DEBUG_CHJ
+> 			printk("[TSP]%d-m (%d,%d)\n", id, fingerInfo[id].x, fingerInfo[id].y );
+> 		#endif
+1829c1899
+< 			//printk("[TSP]%d-d (%d,%d)\n", id, fingerInfo[id].x, fingerInfo[id].y );
+---
+> 			printk("[TSP]%d-d (%d,%d)\n", id, fingerInfo[id].x, fingerInfo[id].y );
+1837c1907
+< 			//printk("[TSP]%d-u (%d,%d)\n", id, fingerInfo[id].x, fingerInfo[id].y );
+---
+> 			printk("[TSP]%d-u (%d,%d)\n", id, fingerInfo[id].x, fingerInfo[id].y );
+1851c1921,1924
+< 
+---
+> 			#if DEBUG_CHJ
+> 				printk("[TSP] x=%3d, y=%3d ", fingerInfo[i].x, fingerInfo[i].y);
+> 				printk("ID[%d] = %s, size=%d\n", i, (fingerInfo[i].status == 0)?"Up ":"", fingerInfo[i].size_id );
+> 			#endif
+1856c1929,1931
+< 
+---
+> 		#if DEBUG_CHJ
+> 			printk("[TSP] Multi-Touch Event[%d] Done!\n", id);
+> 		#endif
+1865c1940,1943
+< 
+---
+> #if DEBUG_CHJ
+> 		printk("[TSP] Key Array obj msg1:0x%x\n", quantum_msg[1]);
+> 		printk("[TSP] Key Array obj msg2:0x%x\n", quantum_msg[2]);
+> #endif
+1873c1951
+< 			//printk("[TSP] Palm Touch! - %d released, Ver. %x\n", quantum_msg[1], info_block->info_id.version );	
+---
+> 			printk("[TSP] Palm Touch! - %d released, Ver. %x\n", quantum_msg[1], info_block->info_id.version );	
+1883c1961
+< 			//printk("[TSP] Palm Touch! - %d suppressed\n", quantum_msg[1]);	
+---
+> 			printk("[TSP] Palm Touch! - %d suppressed\n", quantum_msg[1]);	
+1888a1967,1974
+> 		printk("[TSP] msg[0] = %d, msg[1] = %d\n", quantum_msg[0], quantum_msg[1] );
+> 		if ( quantum_msg[1] & 0x10 )
+> 			printk("[TSP] Calibrating : msg[0] = %d, msg[1] = %d\n", quantum_msg[0], quantum_msg[1] );
+> 		if(quantum_msg[1] & 0x80)
+> 		{
+> 			// RESET detect
+> 			printk("[TSP] TSP IC has reset\n");	
+> 		}
+1892a1979
+> 			printk("[TSP] Configuration change is detected. TSP IC will reset\n");	
+1893a1981
+> 			printk("[TSP] Backup configuration\n");	
+1895a1984
+> 			printk("[TSP] TSP IC is reseting\n");	
+3238a3328,3355
+> void init_changeline(void) 
+> {
+> 
+> }
+> 
+> void disable_changeline_int(void)
+> {
+> }
+> 
+> /*! \brief Enables pin change interrupts on falling edge. */
+> void enable_changeline_int(void)
+> {
+> #if 0 /* TODO */
+> 	set_touch_irq_gpio_init();
+> 	enable_irq_handler();
+> 
+> #endif
+> }
+> 
+> /*! \brief Returns the changeline state. */
+> U8 read_changeline(void)
+> {
+> #if 0 /* TODO */
+> 	return get_touch_irq_gpio_value();
+> #endif
+> 
+> }
+> 
+3298c3415
+< uint32_t get_stored_infoblock_crc(void)
+---
+> uint32_t get_stored_infoblock_crc()
+3399a3517,3520
+> 	printk("[TSP] %s! : %d\n", __func__, __LINE__);
+> 	uint8_t status;
+> 	uint8_t build;   
+> 	static int not_one_time=0;
+3413a3535,3538
+> 	printk("[TSP] Dump state, last rst=%d\n#1=%d,#2=%d,#3=%d,#4=%d,#5=%d,#6=%d,#7=%d,#8=%d,#9=%d,#10=%d,#11=%d\n",
+> 			rst_cnt[0],rst_cnt[1],rst_cnt[2],rst_cnt[3],rst_cnt[4],rst_cnt[5],
+> 			rst_cnt[6],rst_cnt[7],rst_cnt[8],rst_cnt[9],rst_cnt[10],rst_cnt[11] );
+> 
+3464a3590
+> 	DEBUG;
+3657c3783
+< 		input_report_abs(qt602240->input_dev, ABS_MT_WIDTH_MAJOR, fingerInfo[i].size_id);		// Size \B4\EB\BD\C5 ID \C0\FC\B4\DE
+---
+> 		input_report_abs(qt602240->input_dev, ABS_MT_WIDTH_MAJOR, fingerInfo[i].size_id);		// Size ´ë½Å ID Àü´Þ
+3673a3800,3805
+> static void recalibration(void)
+> {
+> 	printk(KERN_NOTICE "[TSP] re-Cal\n");
+> 	calibrate_chip();
+> }
+> 
+3766d3897
+< 	gen_powerconfig_t7_config_t power_config_sleep = {0};
+3772a3904,3905
+> 	gen_powerconfig_t7_config_t power_config_sleep = {0};
+> 
+3812d3944
+< 	gen_powerconfig_t7_config_t power_config_sleep = {0};
+3815a3948,3949
+> 	gen_powerconfig_t7_config_t power_config_sleep = {0};
+> 
+4108a4243
+> 	printk(KERN_INFO "[TSP] %s\n", __FUNCTION__);
+4129a4265
+> 		return size;
+4131d4266
+< 	return size;
+5408a5544,5545
+> 	DEBUG;
+> 
+5439c5576
+< 
+---
+> 		s3cfb_restart_progress();
+5595a5733
+> 	printk("[CHJ] %s - start, %d\n", __func__, __LINE__ );
+5651d5788
+< 	unsigned char *firmware_data ;
+5658a5796
+> 	unsigned char *firmware_data ;
+diff -r ./drivers/Kconfig ../../Kernel/drivers/Kconfig
+122,123d121
+< 
+< source "drivers/motor/Kconfig"
+Seulement dans ./drivers: Kconfig~
+diff -r ./drivers/leds/Kconfig ../../Kernel/drivers/leds/Kconfig
+20,25d19
+< config LEDS_S5P6442
+< 	tristate "LED Support using s5p6442"
+< 	depends on NEW_LEDS
+< 	help
+< 		This option enables support for LEDs for Apollo devices.
+< 
+Seulement dans ./drivers/leds: Kconfig~
+diff -r ./drivers/leds/led-class.c ../../Kernel/drivers/leds/led-class.c
+75c75
+< static DEVICE_ATTR(brightness, 0666, led_brightness_show, led_brightness_store);
+---
+> static DEVICE_ATTR(brightness, 0644, led_brightness_show, led_brightness_store);
+78c78
+< static DEVICE_ATTR(trigger, 0666, led_trigger_show, led_trigger_store);
+---
+> static DEVICE_ATTR(trigger, 0644, led_trigger_show, led_trigger_store);
+Seulement dans ./drivers/leds: leds-s5p6442.c
+diff -r ./drivers/leds/ledtrig-heartbeat.c ../../Kernel/drivers/leds/ledtrig-heartbeat.c
+44c44,47
+<                 heartbeat_data->period = msecs_to_jiffies(10000);
+---
+> 		heartbeat_data->period = 300 +
+> 			(6720 << FSHIFT) / (5 * avenrun[0] + (7 << FSHIFT));
+> 		heartbeat_data->period =
+> 			msecs_to_jiffies(heartbeat_data->period);
+diff -r ./drivers/leds/ledtrig-timer.c ../../Kernel/drivers/leds/ledtrig-timer.c
+155,156c155,156
+< static DEVICE_ATTR(delay_on, 0666, led_delay_on_show, led_delay_on_store);
+< static DEVICE_ATTR(delay_off, 0666, led_delay_off_show, led_delay_off_store);
+---
+> static DEVICE_ATTR(delay_on, 0644, led_delay_on_show, led_delay_on_store);
+> static DEVICE_ATTR(delay_off, 0644, led_delay_off_show, led_delay_off_store);
+diff -r ./drivers/leds/Makefile ../../Kernel/drivers/leds/Makefile
+32d31
+< obj-$(CONFIG_LEDS_S5P6442)	+= leds-s5p6442.o
+Seulement dans ./drivers/leds: Makefile~
+diff -r ./drivers/Makefile ../../Kernel/drivers/Makefile
+117a118,119
+> obj-$(CONFIG_PARAM_BUILT_IN)		+= param/
+> obj-$(CONFIG_J4FS_BUILT_IN)  += j4fs/
+120c122
+< obj-m				+= storage_mtd/
+---
+> #obj-y				+= storage/
+122,123d123
+< obj-m				+= param_mtd/
+< obj-$(CONFIG_VIBETONZ)	+= motor/
+Seulement dans ./drivers: Makefile~
+diff -r ./drivers/media/Kconfig ../../Kernel/drivers/media/Kconfig
+151d150
+< source "drivers/media/s5p6442/openfimg/Kconfig"
+Seulement dans ./drivers/media: Kconfig~
+diff -r ./drivers/media/Makefile ../../Kernel/drivers/media/Makefile
+13d12
+< obj-$(CONFIG_VIDEO_OPENFIMG)	+= s5p6442/openfimg/
+Seulement dans ./drivers/media: Makefile~
+Seulement dans ./drivers/media/s5p6442: openfimg
+diff -r ./drivers/mmc/core/sdio.c ../../Kernel/drivers/mmc/core/sdio.c
+13d12
+< #include <linux/pm_runtime.h>
+232c231
+< 			      struct mmc_card *oldcard, int powered_resume)
+---
+> 			      struct mmc_card *oldcard)
+235c234
+< 	int err,i;
+---
+> 	int err;
+243,247c242,244
+< 	if (!powered_resume) {
+< 		err = mmc_send_io_op_cond(host, host->ocr, &ocr);
+< 		if (err)
+< 			goto err;
+< 	}
+---
+> 	err = mmc_send_io_op_cond(host, host->ocr, &ocr);
+> 	if (err)
+> 		goto err;
+272c269
+< 	if (!powered_resume && !mmc_host_is_spi(host)) {
+---
+> 	if (!mmc_host_is_spi(host)) {
+277,284d273
+< 		/*
+< 		 * Update oldcard with the new RCA received from the SDIO
+< 		 * device -- we're doing this so that it's updated in the
+< 		 * "card" struct when oldcard overwrites that later.
+< 		 */
+< 		if (oldcard)
+< 			oldcard->rca = card->rca;
+< 
+291c280
+< 	if (!powered_resume && !mmc_host_is_spi(host)) {
+---
+> 	if (!mmc_host_is_spi(host)) {
+295,299d283
+< 
+< 		/*
+< 		 * Enable Runtime PM for this func
+< 		 */
+< 		pm_runtime_enable(&card->sdio_func[i]->dev);
+304,305c288
+< 		memcpy(&card->cccr, host->embedded_sdio_data.cccr,
+< 			sizeof(struct sdio_cccr));
+---
+> 		memcpy(&card->cccr, host->embedded_sdio_data.cccr, sizeof(struct sdio_cccr));
+318,320d300
+< 	/*
+< 	 * Read the common CIS tuples.
+< 	 */
+323,324c303
+< 		memcpy(&card->cis, host->embedded_sdio_data.cis,
+< 			sizeof(struct sdio_cis));
+---
+> 		memcpy(&card->cis, host->embedded_sdio_data.cis, sizeof(struct sdio_cis));
+326a306,308
+> 		/*
+> 		 * Read the common CIS tuples.
+> 		 */
+342a325
+> 		return 0;
+477,478c460
+< 	err = mmc_sdio_init_card(host, host->ocr, host->card,
+< 				 (host->pm_flags & MMC_PM_KEEP_POWER));
+---
+> 	err = mmc_sdio_init_card(host, host->ocr, host->card);
+502,517d483
+< static void mmc_sdio_power_restore(struct mmc_host *host)
+< {
+<   int err;
+< 
+<   BUG_ON(!host);
+<   BUG_ON(!host->card);
+< 
+<   mmc_claim_host(host);
+<   err = mmc_sdio_init_card(host, host->ocr, host->card,
+<       (host->pm_flags & MMC_PM_KEEP_POWER));
+<   if (!err && host->sdio_irqs)
+<     mmc_signal_sdio_irq(host);
+<   mmc_release_host(host);
+< }
+< 
+< 
+523d488
+<         .power_restore = mmc_sdio_power_restore,
+565c530
+< 	err = mmc_sdio_init_card(host, host->ocr, NULL, 0);
+---
+> 	err = mmc_sdio_init_card(host, host->ocr, NULL);
+diff -r ./drivers/modemctl/Makefile ../../Kernel/drivers/modemctl/Makefile
+1c1
+< obj-y	+= modemctl.o
+---
+> obj-m	+= modemctl.o
+\ Pas de fin de ligne Ã  la fin du fichier
+Seulement dans ./drivers/modemctl: Makefile~
+Seulement dans ./drivers: motor
+diff -r ./drivers/mtd/Kconfig ../../Kernel/drivers/mtd/Kconfig
+217,230d216
+< config MTD_BML
+<         tristate "Compatibility layer for Samsung BML volumes"
+<         depends on BLOCK
+<         select MTD_BLKDEVS
+<         ---help---
+<           This provides a compatibility layer enabling access to Samsung BML
+<           volumes with possible remapped bad blocks. It is very similar to
+<           the mtdblock interface, adding just bad block remapping support.
+< 
+<           You only need this option for use with Samsung devices which
+<           originally used Samsung proprietary flash management system known as
+<           XSR, FSR or LinuStore. Otherwise, just say N here.
+< 
+< 
+diff -r ./drivers/mtd/Makefile ../../Kernel/drivers/mtd/Makefile
+22d21
+< obj-$(CONFIG_MTD_BML)           += mtd_bml.o
+Seulement dans ./drivers/mtd: mtd_bml.c
+diff -r ./drivers/mtd/onenand/Kconfig ../../Kernel/drivers/mtd/onenand/Kconfig
+0a1,4
+> #
+> # linux/drivers/mtd/onenand/Kconfig
+> #
+> 
+3a8
+> 	select MTD_PARTITIONS
+27c32
+< 	depends on ARCH_OMAP2 || ARCH_OMAP3
+---
+> 	depends on MTD_ONENAND && (ARCH_OMAP2 || ARCH_OMAP3)
+31,46d35
+< 
+< config MTD_ONENAND_SAMSUNG
+<         tristate "OneNAND on Samsung SOC controller support"
+<         depends on ARCH_S3C64XX || ARCH_S5PC100 || ARCH_S5PV210 || ARCH_EXYNOS4
+<         help
+<           Support for a OneNAND flash device connected to an Samsung SOC.
+<           S3C64XX/S5PC100 use command mapping method.
+<           S5PC110/S5PC210 use generic OneNAND method.
+< 
+< config MTD_ONENAND_SAMSUNG_AUDI
+< 	tristate "OneNAND on Samsung AP (with AUDI controller) support"
+< 	depends on ARCH_S5PV210 || ARCH_S5PV310 || ARCH_S5P64XX
+< 	default y
+< 	help
+< 	  Support for a OneNAND flash device connected to an Samsung CPU
+< 	  via the AUDI OneNAND controller.
+diff -r ./drivers/mtd/onenand/Makefile ../../Kernel/drivers/mtd/onenand/Makefile
+11d10
+< obj-$(CONFIG_MTD_ONENAND_SAMSUNG)       += samsung.o
+16,17c15,16
+< ifeq ($(CONFIG_MTD_ONENAND_SAMSUNG_AUDI),y)
+< onenand-objs = samsung_audi.o
+---
+> ifeq ($(CONFIG_CPU_S5P6442),y)
+> onenand-objs = s5p6442.o
+Seulement dans ./drivers/mtd/onenand: samsung_apollo.h
+Seulement dans ./drivers/mtd/onenand: samsung_audi.c
+Seulement dans ./drivers/net/wireless: bcm4329
+diff -r ./drivers/net/wireless/Kconfig ../../Kernel/drivers/net/wireless/Kconfig
+491d490
+< source "drivers/net/wireless/bcm4329/Kconfig"
+Seulement dans ./drivers/net/wireless: Kconfig~
+diff -r ./drivers/net/wireless/Makefile ../../Kernel/drivers/net/wireless/Makefile
+65,66d64
+< 
+< obj-$(CONFIG_BCM4329)   += bcm4329/
+Seulement dans ./drivers/net/wireless: Makefile~
+diff -r ./drivers/onedram/Makefile ../../Kernel/drivers/onedram/Makefile
+4c4
+< obj-y	+= onedram.o
+---
+> obj-m	+= onedram.o
+Seulement dans ./drivers/onedram: Makefile~
+Seulement dans ./drivers: param_mtd
+diff -r ./drivers/power/s5p6442_battery.c ../../Kernel/drivers/power/s5p6442_battery.c
+34a35
+> 
+61c62
+< static ssize_t s3c_bat_store(struct device *dev,
+---
+> static ssize_t s3c_bat_store(struct device *dev, 
+73c74
+< static ssize_t s3c_test_store(struct device *dev,
+---
+> static ssize_t s3c_test_store(struct device *dev, 
+94,95c95,96
+< #define ADC_TOTAL_COUNT		100 //
+< #define POLLING_INTERVAL	4000 // 4000
+---
+> #define ADC_TOTAL_COUNT		20
+> #define POLLING_INTERVAL	4000
+128c129
+< 
+---
+> 	
+241c242
+< 			if (adc_arr[i] > adc_max)
+---
+> 			if (adc_arr[i] > adc_max) 
+317c318
+< static void s3c_bat_set_compesation(int mode,
+---
+> static void s3c_bat_set_compesation(int mode, 
+342c343
+< 	int chg_current = 0;
+---
+> 	int chg_current = 0; 
+346d346
+<     printk("---> check_chg_current : %d\n",chg_current );
+373c373
+< 		(fg_vcell <= RECHARGE_COND_VOLTAGE ||
+---
+> 		(fg_vcell <= RECHARGE_COND_VOLTAGE || 
+397c397
+< 
+---
+> 	
+404,405d403
+< //    printk("----> battery : s3c_get_bat_level : fg_soc : %d fg_vcell : %d\n", fg_soc, fg_vcell);
+< 
+435c433
+< 			__func__, fg_vcell, fg_soc,
+---
+> 			__func__, fg_vcell, fg_soc, 
+472c470
+< 				!s3c_bat_info.bat_info.charging_enabled &&
+---
+> 				!s3c_bat_info.bat_info.charging_enabled && 
+584d581
+< 
+590c587
+< 
+---
+> 	
+617,618d613
+< //	printk("----> battery :s3c_get_bat_level : bat_vol = %d batt_full : %d batt_max : %d\n", bat_vol, batt_full, batt_max);
+< 
+622c617
+< 		if (bat_vol > (batt_full + temp) ||
+---
+> 		if (bat_vol > (batt_full + temp) || 
+626,628c621
+< 		{
+< 		        bat_level = 90 + (((bat_vol - batt_full) *10) / temp);
+< 		}
+---
+> 			bat_level = 90;
+642c635,638
+< 		bat_level = 70 + (((bat_vol - batt_almost) *10) / temp);
+---
+> 		if (bat_vol > (batt_almost + 86))
+> 			bat_level = 80;
+> 		else
+> 			bat_level = 70;
+649c645,648
+< 		bat_level = 50 + (((bat_vol - batt_high) *10) / temp);
+---
+> 		if (bat_vol > (batt_high + 62))
+> 			bat_level = 60;
+> 		else
+> 			bat_level = 50;
+655c654,657
+< 		bat_level = 30 + (((bat_vol - batt_medium) *10) / temp);
+---
+> 		if (bat_vol > (batt_medium + 26))
+> 			bat_level = 40;
+> 		else
+> 			bat_level = 30;
+661c663,666
+< 		bat_level = 15 + ((( bat_vol - batt_low) *5) / temp);
+---
+> 		if (bat_vol > (batt_low + 50))
+> 			bat_level = 20;
+> 		else
+> 			bat_level = 15;		
+699c704
+< 
+---
+> 	
+709c714
+< 
+---
+> 		
+712,713d716
+<     //bat_level = tmpcal;
+< 
+716c719
+< 			__func__, bat_vol, bat_level,
+---
+> 			__func__, bat_vol, bat_level, 
+960c963
+< 
+---
+> 		
+981c984
+< #endif
+---
+> #endif		
+984c987
+< __map_temperature__:
+---
+> __map_temperature__:	
+1015c1018
+<         charger_type_t charger = CHARGER_BATTERY;
+---
+>         charger_type_t charger = CHARGER_BATTERY; 
+1017c1020
+< 
+---
+>         
+1019c1022
+< 
+---
+>         
+1043c1046
+< static int s3c_bat_get_property(struct power_supply *bat_ps,
+---
+> static int s3c_bat_get_property(struct power_supply *bat_ps, 
+1077,1078c1080,1081
+< static int s3c_power_get_property(struct power_supply *bat_ps,
+< 		enum power_supply_property psp,
+---
+> static int s3c_power_get_property(struct power_supply *bat_ps, 
+> 		enum power_supply_property psp, 
+1082c1085
+< 
+---
+> 	
+1099c1102
+< 
+---
+> 	
+1170c1173
+< 	BATT_CHG_CURRENT,
+---
+> 	BATT_CHG_CURRENT,	
+1195c1198
+< 
+---
+>         
+1202c1205
+< 
+---
+>         
+1206c1209
+< succeed:
+---
+> succeed:        
+1225c1228
+< 		s3c_bat_info.bat_info.batt_vol_adc =
+---
+> 		s3c_bat_info.bat_info.batt_vol_adc = 
+1243c1246
+< 		s3c_bat_info.bat_info.batt_temp_adc =
+---
+> 		s3c_bat_info.bat_info.batt_temp_adc = 
+1248c1251
+<                 break;
+---
+>                 break;	
+1283c1286
+< 		s3c_bat_info.bat_info.batt_current =
+---
+> 		s3c_bat_info.bat_info.batt_current = 
+1311,1312c1314,1315
+<         }
+< 
+---
+>         }       
+>         
+1345c1348
+< static ssize_t s3c_bat_store(struct device *dev,
+---
+> static ssize_t s3c_bat_store(struct device *dev, 
+1376c1379
+< 			s3c_bat_info.polling_interval = POLLING_INTERVAL_TEST;
+---
+> 			s3c_bat_info.polling_interval = POLLING_INTERVAL_TEST;			
+1379c1382
+< 				mod_timer(&polling_timer, jiffies +
+---
+> 				mod_timer(&polling_timer, jiffies + 
+1384c1387
+< 			s3c_bat_info.polling_interval = POLLING_INTERVAL;
+---
+> 			s3c_bat_info.polling_interval = POLLING_INTERVAL;		
+1387c1390
+< 				mod_timer(&polling_timer,jiffies +
+---
+> 				mod_timer(&polling_timer,jiffies + 
+1434c1437
+< 
+---
+> 			
+1460c1463
+< /* To remove TDMA noise, set the EAR_SEL gpio set high when data call */
+---
+> /* To remove TDMA noise, set the EAR_SEL gpio set high when data call */		
+1463c1466
+< 
+---
+> 		
+1479c1482
+<         }
+---
+>         }       
+1543c1546
+< 
+---
+>         
+1550c1553
+< 
+---
+>         
+1554c1557
+< succeed:
+---
+> succeed:        
+1668,1669c1671,1672
+<         }
+< 
+---
+>         }       
+>         
+1674c1677
+< static ssize_t s3c_test_store(struct device *dev,
+---
+> static ssize_t s3c_test_store(struct device *dev, 
+1686c1689
+< 			if (mode)
+---
+> 			if (mode) 
+1702c1705
+<         }
+---
+>         }       
+1819,1820d1821
+< //    printk("---> battery : s3c_bat_status_update : level : %d\n",s3c_bat_info.bat_info.level );
+< 
+1823,1826d1823
+< 
+< //    printk("---> battery : s3c_bat_status_update : new level : %d\n",level_val );
+< 
+< 
+1850c1847
+< 	if (old_level != s3c_bat_info.bat_info.level
+---
+> 	if (old_level != s3c_bat_info.bat_info.level 
+1873c1870
+< 
+---
+> 	
+1916c1913
+< 		dev_dbg(dev, "%s: status : %s\n", __func__,
+---
+> 		dev_dbg(dev, "%s: status : %s\n", __func__, 
+1937c1934
+< 		dev_dbg(dev, "%s: status : %s\n", __func__,
+---
+> 		dev_dbg(dev, "%s: status : %s\n", __func__, 
+1979c1976
+< static int s3c_bat_suspend(struct platform_device *pdev,
+---
+> static int s3c_bat_suspend(struct platform_device *pdev, 
+2073c2070
+< 
+---
+> 	
+2131c2128
+< 
+---
+> 	
+2219c2216
+< 		ret = power_supply_register(&pdev->dev,
+---
+> 		ret = power_supply_register(&pdev->dev, 
+2235c2232
+< 	/* Request IRQ */
+---
+> 	/* Request IRQ */ 
+2256c2253
+< 		dev_dbg(dev, "%s: will poll for status\n",
+---
+> 		dev_dbg(dev, "%s: will poll for status\n", 
+2306c2303
+< 
+---
+>  
+2323c2320
+< 	s3c_gpio_cfgpin(gpio_ta_connected,
+---
+> 	s3c_gpio_cfgpin(gpio_ta_connected, 
+2327c2324
+< 	s3c_gpio_cfgpin(gpio_chg_ing,
+---
+> 	s3c_gpio_cfgpin(gpio_chg_ing, 
+2331c2328
+< 	s3c_gpio_cfgpin(gpio_chg_en,
+---
+> 	s3c_gpio_cfgpin(gpio_chg_en, 
+2333c2330
+< 	s3c_gpio_setpull(gpio_chg_en, S3C_GPIO_PULL_NONE);
+---
+> 	s3c_gpio_setpull(gpio_chg_en, S3C_GPIO_PULL_NONE); 
+diff -r ./drivers/sensor/accel/bma020_acc.c ../../Kernel/drivers/sensor/accel/bma020_acc.c
+381,400d380
+< void bma020_set_delay(short delay)
+< {
+< 	int64_t new_delay;
+< 
+< 	// ms to ns
+< 	new_delay = delay * 1000000;
+< 
+< //	printk("------> BMA020 from AKM : new delay = %lldns, old delay = %lldns\n",
+< //		    new_delay, ktime_to_ns(bma020.acc_poll_delay));
+< 	mutex_lock(&bma020.power_lock);
+< 	if (new_delay != ktime_to_ns(bma020.acc_poll_delay)) {
+< 		bma_acc_disable();
+< 		bma020.acc_poll_delay = ns_to_ktime(new_delay);
+<                 bma020.state |= ACC_ENABLED;
+< 		bma_acc_enable();
+< 	}
+< 	mutex_unlock(&bma020.power_lock);
+< 	return;
+< }
+< 
+610c590
+< //exit:
+---
+> exit:
+diff -r ./drivers/sensor/accel/bma020.h ../../Kernel/drivers/sensor/accel/bma020.h
+841c841
+< void bma020_set_delay(short);
+---
+> 
+diff -r ./drivers/sensor/compass/ak8973b.c ../../Kernel/drivers/sensor/compass/ak8973b.c
+32d31
+< extern void bma020_set_delay(short delay);
+35c34
+< typedef struct {
+---
+> struct ak8973b_data {
+39,41c38
+< } ak8973b_data_t;
+< 
+< ak8973b_data_t ak8973b_data;
+---
+> };
+82c79
+< //config_ctrl_reg(ms1, AKECS_REG_MS1);
+---
+> config_ctrl_reg(ms1, AKECS_REG_MS1);
+134a132
+> 	int ret = -1;
+138a137
+> 			ret = 0;
+141,142c140
+< 
+< 	return nonseekable_open(inode, file);
+---
+> 	return ret;
+156c154
+< 	ak8973b_data_t *data = i2c_get_clientdata(this_client);
+---
+> 	struct ak8973b_data *data = i2c_get_clientdata(this_client);
+202a201
+> 		gprintk("Proximity = %d\n", rbuf[12]);
+210c209
+< 	ak8973b_data_t *data = i2c_get_clientdata(this_client);
+---
+> 	struct ak8973b_data *data = i2c_get_clientdata(this_client);
+412c411
+< 	short  value[13];
+---
+> 	short  value[12];
+428d426
+< 	value[12]=0;			/* proximity */
+473c471
+< 			if (copy_from_user(&flag, argp, sizeof(flag))) {
+---
+> 			if (copy_from_user(&flag, argp, sizeof(flag)))
+475d472
+< 			}
+514d510
+< 			bma020_set_delay(akmd_delay);
+561a558
+> 	int i;
+604c601
+< //			gprintk("[AK8973B] ECS_IOCTL_READ %x\n", cmd);
+---
+> 			gprintk("[AK8973B] ECS_IOCTL_READ %x\n", cmd);
+611c608
+< //			for(i=0; i<rwbuf[0]; i++){
+---
+> 			for(i=0; i<rwbuf[0]; i++){
+613,614c610,611
+< //			}
+< //			gprintk(" ret = %d\n", ret);
+---
+> 			}
+> 			gprintk(" ret = %d\n", ret);
+619,621c616,618
+< //			gprintk("[AK8973B] ECS_IOCTL_WRITE %x\n", cmd);
+< //			gprintk(" len %02x:", rwbuf[0]);
+< //			for(i=0; i<rwbuf[0]; i++){
+---
+> 			gprintk("[AK8973B] ECS_IOCTL_WRITE %x\n", cmd);
+> 			gprintk(" len %02x:", rwbuf[0]);
+> 			for(i=0; i<rwbuf[0]; i++){
+623c620
+< //			}
+---
+> 			}
+628c625
+< ///			gprintk(" ret = %d\n", ret);
+---
+> 			gprintk(" ret = %d\n", ret);
+645c642
+< //			for(i=0; i<ret; i++){
+---
+> 			for(i=0; i<ret; i++){
+647c644
+< //			}
+---
+> 			}
+651c648
+< //			gprintk("[AK8973B] ECS_IOCTL_SET_YPR %x ypr=%x\n", cmd, (unsigned int)value);
+---
+> 			gprintk("[AK8973B] ECS_IOCTL_SET_YPR %x ypr=%x\n", cmd, (unsigned int)value);
+655c652
+< //			gprintk("[AK8973B] ECS_IOCTL_GET_OPEN_STATUS %x start\n", cmd);
+---
+> 			gprintk("[AK8973B] ECS_IOCTL_GET_OPEN_STATUS %x start\n", cmd);
+657c654
+< //			gprintk("[AK8973B] ECS_IOCTL_GET_OPEN_STATUS %x end status=%x\n", cmd, status);
+---
+> 			gprintk("[AK8973B] ECS_IOCTL_GET_OPEN_STATUS %x end status=%x\n", cmd, status);
+661c658
+< //			gprintk("[AK8973B] ECS_IOCTL_GET_CLOSE_STATUS %x start\n", cmd);
+---
+> 			gprintk("[AK8973B] ECS_IOCTL_GET_CLOSE_STATUS %x start\n", cmd);
+663c660
+< //			gprintk("[AK8973B] ECS_IOCTL_GET_CLOSE_STATUS %x end status=%x\n", cmd, status);
+---
+> 			gprintk("[AK8973B] ECS_IOCTL_GET_CLOSE_STATUS %x end status=%x\n", cmd, status);
+667c664
+< //			gprintk("[AK8973B] ECS_IOCTL_GET_DELAY %x delay=%x\n", cmd, delay);
+---
+> 			gprintk("[AK8973B] ECS_IOCTL_GET_DELAY %x delay=%x\n", cmd, delay);
+706,710c703,704
+< 
+< 	if(get_gp2a_enable_state() == 0)  
+< 	{	
+<    	   atomic_set(&suspend_flag, 1);
+< 	   if (atomic_read(&open_flag) == 2)
+---
+> 	atomic_set(&suspend_flag, 1);
+> 	if (atomic_read(&open_flag) == 2)
+713c707
+< 	   atomic_set(&reserve_open_flag, atomic_read(&open_flag));
+---
+> 	atomic_set(&reserve_open_flag, atomic_read(&open_flag));
+720,721c714,717
+< 	   atomic_set(&open_flag, 0);
+< 	   wake_up(&open_wq);
+---
+> 	if(get_gp2a_enable_state() == 0)  
+> 	{	
+> 		atomic_set(&open_flag, 0);
+> 		wake_up(&open_wq);
+727,731c723,725
+<         if (atomic_read(&suspend_flag) == 1) {
+< 	   atomic_set(&suspend_flag, 0);
+< 	   atomic_set(&open_flag, atomic_read(&reserve_open_flag));
+< 	   wake_up(&open_wq);
+<         }
+---
+> 	atomic_set(&suspend_flag, 0);
+> 	atomic_set(&open_flag, atomic_read(&reserve_open_flag));
+> 	wake_up(&open_wq);
+819c813,814
+< 	ak8973b_data_t *akm;
+---
+> 	struct ak8973b_data *akm;
+> 	struct device *dev = &client->dev;
+824c819
+< 	/*akm = kzalloc(sizeof(struct ak8973b_data), GFP_KERNEL);
+---
+> 	akm = kzalloc(sizeof(struct ak8973b_data), GFP_KERNEL);
+828,829c823
+< 	}*/
+<         akm = &ak8973b_data;
+---
+> 	}
+905a900
+> 
+907,909c902,904
+< 	ak8973b_data.early_suspend.suspend = ak8973b_early_suspend;
+< 	ak8973b_data.early_suspend.resume = ak8973b_early_resume;
+< 	register_early_suspend(&ak8973b_data.early_suspend);
+---
+> 	akm->early_suspend.suspend = ak8973b_early_suspend;
+> 	akm->early_suspend.resume = ak8973b_early_resume;
+> 	register_early_suspend(&akm->early_suspend);
+910a906
+> 	
+919c915
+< //exit_alloc_data_failed:
+---
+> exit_alloc_data_failed:
+925c921,923
+< 	ak8973b_data_t *akm = i2c_get_clientdata(client);
+---
+> 	int err;
+> 
+> 	struct ak8973b_data *akm = i2c_get_clientdata(client);
+diff -r ./drivers/sensor/compass/ak8973b.h ../../Kernel/drivers/sensor/compass/ak8973b.h
+110c110
+< #if 1 
+---
+> #if 0 
+126c126
+< extern int apollo_get_remapped_hw_rev_pin(void); 
+---
+> extern int apollo_get_remapped_hw_rev_pin(); 
+129,130d128
+< extern void gp2a_prox_mode_normal(void);
+< extern void gp2a_prox_mode_sleep(void);
+diff -r ./drivers/sensor/proximity/cm3607.c ../../Kernel/drivers/sensor/proximity/cm3607.c
+181a182
+> 	printk("--------Proximity Sensor driver probe start \n");
+285a287
+> 	printk("--------Proximity Sensor driver probe end \n");
+diff -r ./drivers/sensor/proximity/gp2a_prox.c ../../Kernel/drivers/sensor/proximity/gp2a_prox.c
+40a41
+> 	debug("%s called",__func__);
+45a47
+> 	debug("%s called",__func__);
+66a69
+> 				debug("PROX_IOC_NORMAL_MODE called");
+71a75,76
+> 				else
+> 					debug("Proximity Sensor is already Normal Mode");
+75a81
+> 				debug("PROX_IOC_SHUTDOWN_MODE called");				
+80a87,88
+> 				else
+> 					debug("Proximity Sensor is already set in Shutdown mode");
+152a161
+> 	debug("%s called",__func__); 
+201a211,222
+> 	debug("%s called",__func__); 
+> #if 0
+> 	int ret =0;
+> 	u8 prox_value;
+> 	if((ret=gp2a_i2c_read(&prox_value))<0)
+> 	{
+> 		error("gp2a_i2c_read failed");
+> 		return -1;
+> 	}
+> 	else
+> 		return (!prox_value);
+> #else	
+202a224
+> #endif
+207a230
+> 	debug("%s called",__func__); 
+221a245,246
+> 	debug("Reporting to the input events");
+> 	debug("gpio_get_value of GPIO_PS_OUT is %d",gpio_get_value(GPIO_PS_OUT));   //test			
+233c258
+< 	wake_lock_timeout(&prox_wakelock, HZ);
+---
+> 	wake_lock_timeout(&prox_wakelock, 2*HZ);
+235a261
+> 	debug("enable_irq IRQ_NO:%d",gp2a_data->irq);
+246a273
+>   	debug("%s called IRQ_NUM:%d",__func__,irq);
+249a277
+> 		debug("disable_irq IRQ_NO:%d",gp2a_data->irq);
+256a285
+> 	debug("PROX_IRQ handled");
+303a333
+> 	printk("------ %s start \n", __func__);	
+347a378
+> 	debug("Input device settings complete");
+357a389
+> 	debug("Workqueue settings complete");	
+363,364c395,396
+<            error("GP2A request_irq failed IRQ_NO:%d", PROX_IRQ);
+<            goto DESTROY_WORK_QUEUE;
+---
+>         error("GP2A request_irq failed IRQ_NO:%d", PROX_IRQ);
+>         goto DESTROY_WORK_QUEUE;
+365a398,399
+> 	else
+> 		debug("GP2A request_irq success IRQ_NO:%d", PROX_IRQ);
+398c432
+< 	gp2a_prox_mode(1);
+---
+> 	gp2a_prox_mode(0);
+399a434
+> 	printk("------ %s end\n", __func__);	
+416a452
+>   	debug("%s called",__func__); 
+428,438c464,477
+< void gp2a_prox_mode_normal()
+< {  
+< 	gp2a_prox_mode(1);
+< 	enable_irq(gp2a_data->irq);
+< }
+< EXPORT_SYMBOL(gp2a_prox_mode_normal);
+< 
+< void gp2a_prox_mode_sleep()
+< {  
+< 	disable_irq(gp2a_data->irq);
+< 	gp2a_prox_mode(0);
+---
+> #ifdef CONFIG_PM
+> static int gp2a_prox_suspend(struct i2c_client *client, pm_message_t mesg)
+> {   	   
+> 	debug("%s called",__func__); 
+> //	disable_irq(gp2a_data->irq);
+> //	gp2a_prox_mode(0);
+>     return 0;
+> }
+> static int gp2a_prox_resume(struct i2c_client *client)
+> {  	   
+> 	debug("%s called",__func__); 
+> //	gp2a_prox_mode(1);
+> //	enable_irq(gp2a_data->irq);
+>     return 0;
+440,441c479
+< EXPORT_SYMBOL(gp2a_prox_mode_sleep);
+< 
+---
+> #else
+443c481,482
+< #define	 gp2a_prox_resume NULL
+---
+> #define	 gp2a_prox_resume	 NULL
+> #endif
+464a504
+> 	debug("%s called",__func__);
+477a518
+> 	debug("%s called",__func__); 
+diff -r ./drivers/sensor/proximity/gp2a_prox.h ../../Kernel/drivers/sensor/proximity/gp2a_prox.h
+47a48,49
+> static int gp2a_prox_suspend(struct i2c_client *, pm_message_t);
+> static int gp2a_prox_resume(struct i2c_client *);
+55,56d56
+< void gp2a_prox_mode_normal(void);
+< void gp2a_prox_mode_sleep(void);
+58c58
+< extern int apollo_get_remapped_hw_rev_pin(void);
+---
+> extern int apollo_get_remapped_hw_rev_pin();
+62c62
+< #endif
+---
+> #endif
+\ Pas de fin de ligne Ã  la fin du fichier
+diff -r ./drivers/staging/android/binder.c ../../Kernel/drivers/staging/android/binder.c
+29c29
+< #include <linux/debugfs.h>
+---
+> #include <linux/proc_fs.h>
+32,33d31
+< #include <linux/seq_file.h>
+< #include <linux/slab.h>
+46,47c44,45
+< static struct dentry *binder_debugfs_dir_entry_root;
+< static struct dentry *binder_debugfs_dir_entry_proc;
+---
+> static struct proc_dir_entry *binder_proc_dir_entry_root;
+> static struct proc_dir_entry *binder_proc_dir_entry_proc;
+53,68c51,52
+< #define BINDER_DEBUG_ENTRY(name) \
+< static int binder_##name##_open(struct inode *inode, struct file *file) \
+< { \
+< 	return single_open(file, binder_##name##_show, inode->i_private); \
+< } \
+< \
+< static const struct file_operations binder_##name##_fops = { \
+< 	.owner = THIS_MODULE, \
+< 	.open = binder_##name##_open, \
+< 	.read = seq_read, \
+< 	.llseek = seq_lseek, \
+< 	.release = single_release, \
+< }
+< 
+< static int binder_proc_show(struct seq_file *m, void *unused);
+< BINDER_DEBUG_ENTRY(proc);
+---
+> static int binder_read_proc_proc(char *page, char **start, off_t off,
+> 				 int count, int *eof, void *data);
+314d297
+< 	struct dentry *debugfs_entry;
+1613d1595
+< 				return_error = BR_FAILED_REPLY;
+2897c2879
+< 	if (binder_debugfs_dir_entry_proc) {
+---
+> 	if (binder_proc_dir_entry_proc) {
+2900,2901c2882,2885
+< 		proc->debugfs_entry = debugfs_create_file(strbuf, S_IRUGO,
+< 			binder_debugfs_dir_entry_proc, proc, &binder_proc_fops);
+---
+> 		remove_proc_entry(strbuf, binder_proc_dir_entry_proc);
+> 		create_proc_read_entry(strbuf, S_IRUGO,
+> 				       binder_proc_dir_entry_proc,
+> 				       binder_read_proc_proc, proc);
+2938c2922,2927
+< 	debugfs_remove(proc->debugfs_entry);
+---
+> 	if (binder_proc_dir_entry_proc) {
+> 		char strbuf[11];
+> 		snprintf(strbuf, sizeof(strbuf), "%u", proc->pid);
+> 		remove_proc_entry(strbuf, binder_proc_dir_entry_proc);
+> 	}
+> 
+3122,3123c3111,3112
+< static void print_binder_transaction(struct seq_file *m, const char *prefix,
+< 				     struct binder_transaction *t)
+---
+> static char *print_binder_transaction(char *buf, char *end, const char *prefix,
+> 				      struct binder_transaction *t)
+3125,3132c3114,3124
+< 	seq_printf(m,
+< 		   "%s %d: %p from %d:%d to %d:%d code %x flags %x pri %ld r%d",
+< 		   prefix, t->debug_id, t,
+< 		   t->from ? t->from->proc->pid : 0,
+< 		   t->from ? t->from->pid : 0,
+< 		   t->to_proc ? t->to_proc->pid : 0,
+< 		   t->to_thread ? t->to_thread->pid : 0,
+< 		   t->code, t->flags, t->priority, t->need_reply);
+---
+> 	buf += snprintf(buf, end - buf,
+> 			"%s %d: %p from %d:%d to %d:%d code %x "
+> 			"flags %x pri %ld r%d",
+> 			prefix, t->debug_id, t,
+> 			t->from ? t->from->proc->pid : 0,
+> 			t->from ? t->from->pid : 0,
+> 			t->to_proc ? t->to_proc->pid : 0,
+> 			t->to_thread ? t->to_thread->pid : 0,
+> 			t->code, t->flags, t->priority, t->need_reply);
+> 	if (buf >= end)
+> 		return buf;
+3134,3135c3126,3127
+< 		seq_puts(m, " buffer free\n");
+< 		return;
+---
+> 		buf += snprintf(buf, end - buf, " buffer free\n");
+> 		return buf;
+3137,3156c3129,3153
+< 	if (t->buffer->target_node)
+< 		seq_printf(m, " node %d",
+< 			   t->buffer->target_node->debug_id);
+< 	seq_printf(m, " size %zd:%zd data %p\n",
+< 		   t->buffer->data_size, t->buffer->offsets_size,
+< 		   t->buffer->data);
+< }
+< 
+< static void print_binder_buffer(struct seq_file *m, const char *prefix,
+< 				struct binder_buffer *buffer)
+< {
+< 	seq_printf(m, "%s %d: %p size %zd:%zd %s\n",
+< 		   prefix, buffer->debug_id, buffer->data,
+< 		   buffer->data_size, buffer->offsets_size,
+< 		   buffer->transaction ? "active" : "delivered");
+< }
+< 
+< static void print_binder_work(struct seq_file *m, const char *prefix,
+< 			      const char *transaction_prefix,
+< 			      struct binder_work *w)
+---
+> 	if (t->buffer->target_node) {
+> 		buf += snprintf(buf, end - buf, " node %d",
+> 				t->buffer->target_node->debug_id);
+> 		if (buf >= end)
+> 			return buf;
+> 	}
+> 	buf += snprintf(buf, end - buf, " size %zd:%zd data %p\n",
+> 			t->buffer->data_size, t->buffer->offsets_size,
+> 			t->buffer->data);
+> 	return buf;
+> }
+> 
+> static char *print_binder_buffer(char *buf, char *end, const char *prefix,
+> 				 struct binder_buffer *buffer)
+> {
+> 	buf += snprintf(buf, end - buf, "%s %d: %p size %zd:%zd %s\n",
+> 			prefix, buffer->debug_id, buffer->data,
+> 			buffer->data_size, buffer->offsets_size,
+> 			buffer->transaction ? "active" : "delivered");
+> 	return buf;
+> }
+> 
+> static char *print_binder_work(char *buf, char *end, const char *prefix,
+> 			       const char *transaction_prefix,
+> 			       struct binder_work *w)
+3164c3161
+< 		print_binder_transaction(m, transaction_prefix, t);
+---
+> 		buf = print_binder_transaction(buf, end, transaction_prefix, t);
+3167c3164,3165
+< 		seq_printf(m, "%stransaction complete\n", prefix);
+---
+> 		buf += snprintf(buf, end - buf,
+> 				"%stransaction complete\n", prefix);
+3171,3172c3169,3171
+< 		seq_printf(m, "%snode work %d: u%p c%p\n",
+< 			   prefix, node->debug_id, node->ptr, node->cookie);
+---
+> 		buf += snprintf(buf, end - buf, "%snode work %d: u%p c%p\n",
+> 				prefix, node->debug_id, node->ptr,
+> 				node->cookie);
+3175c3174
+< 		seq_printf(m, "%shas dead binder\n", prefix);
+---
+> 		buf += snprintf(buf, end - buf, "%shas dead binder\n", prefix);
+3178c3177,3178
+< 		seq_printf(m, "%shas cleared dead binder\n", prefix);
+---
+> 		buf += snprintf(buf, end - buf,
+> 				"%shas cleared dead binder\n", prefix);
+3181c3181,3182
+< 		seq_printf(m, "%shas cleared death notification\n", prefix);
+---
+> 		buf += snprintf(buf, end - buf,
+> 				"%shas cleared death notification\n", prefix);
+3184c3185,3186
+< 		seq_printf(m, "%sunknown work: type %d\n", prefix, w->type);
+---
+> 		buf += snprintf(buf, end - buf, "%sunknown work: type %d\n",
+> 				prefix, w->type);
+3186a3189
+> 	return buf;
+3189,3191c3192,3194
+< static void print_binder_thread(struct seq_file *m,
+< 				struct binder_thread *thread,
+< 				int print_always)
+---
+> static char *print_binder_thread(char *buf, char *end,
+> 				 struct binder_thread *thread,
+> 				 int print_always)
+3195,3196c3198,3199
+< 	size_t start_pos = m->count;
+< 	size_t header_pos;
+---
+> 	char *start_buf = buf;
+> 	char *header_buf;
+3198,3199c3201,3203
+< 	seq_printf(m, "  thread %d: l %02x\n", thread->pid, thread->looper);
+< 	header_pos = m->count;
+---
+> 	buf += snprintf(buf, end - buf, "  thread %d: l %02x\n",
+> 			thread->pid, thread->looper);
+> 	header_buf = buf;
+3201a3206,3207
+> 		if (buf >= end)
+> 			break;
+3203,3204c3209,3210
+< 			print_binder_transaction(m,
+< 						 "    outgoing transaction", t);
+---
+> 			buf = print_binder_transaction(buf, end,
+> 						"    outgoing transaction", t);
+3207,3208c3213,3214
+< 			print_binder_transaction(m,
+< 						 "    incoming transaction", t);
+---
+> 			buf = print_binder_transaction(buf, end,
+> 						"    incoming transaction", t);
+3211c3217,3218
+< 			print_binder_transaction(m, "    bad transaction", t);
+---
+> 			buf = print_binder_transaction(buf, end,
+> 						"    bad transaction", t);
+3216c3223,3226
+< 		print_binder_work(m, "    ", "    pending transaction", w);
+---
+> 		if (buf >= end)
+> 			break;
+> 		buf = print_binder_work(buf, end, "    ",
+> 					"    pending transaction", w);
+3218,3219c3228,3230
+< 	if (!print_always && m->count == header_pos)
+< 		m->count = start_pos;
+---
+> 	if (!print_always && buf == header_buf)
+> 		buf = start_buf;
+> 	return buf;
+3222c3233
+< static void print_binder_node(struct seq_file *m, struct binder_node *node)
+---
+> static char *print_binder_node(char *buf, char *end, struct binder_node *node)
+3233,3237c3244,3252
+< 	seq_printf(m, "  node %d: u%p c%p hs %d hw %d ls %d lw %d is %d iw %d",
+< 		   node->debug_id, node->ptr, node->cookie,
+< 		   node->has_strong_ref, node->has_weak_ref,
+< 		   node->local_strong_refs, node->local_weak_refs,
+< 		   node->internal_strong_refs, count);
+---
+> 	buf += snprintf(buf, end - buf,
+> 			"  node %d: u%p c%p hs %d hw %d ls %d lw %d "
+> 			"is %d iw %d",
+> 			node->debug_id, node->ptr, node->cookie,
+> 			node->has_strong_ref, node->has_weak_ref,
+> 			node->local_strong_refs, node->local_weak_refs,
+> 			node->internal_strong_refs, count);
+> 	if (buf >= end)
+> 		return buf;
+3239,3241c3254,3268
+< 		seq_puts(m, " proc");
+< 		hlist_for_each_entry(ref, pos, &node->refs, node_entry)
+< 			seq_printf(m, " %d", ref->proc->pid);
+---
+> 		buf += snprintf(buf, end - buf, " proc");
+> 		if (buf >= end)
+> 			return buf;
+> 		hlist_for_each_entry(ref, pos, &node->refs, node_entry) {
+> 			buf += snprintf(buf, end - buf, " %d", ref->proc->pid);
+> 			if (buf >= end)
+> 				return buf;
+> 		}
+> 	}
+> 	buf += snprintf(buf, end - buf, "\n");
+> 	list_for_each_entry(w, &node->async_todo, entry) {
+> 		if (buf >= end)
+> 			break;
+> 		buf = print_binder_work(buf, end, "    ",
+> 					"    pending async transaction", w);
+3243,3246c3270
+< 	seq_puts(m, "\n");
+< 	list_for_each_entry(w, &node->async_todo, entry)
+< 		print_binder_work(m, "    ",
+< 				  "    pending async transaction", w);
+---
+> 	return buf;
+3249c3273
+< static void print_binder_ref(struct seq_file *m, struct binder_ref *ref)
+---
+> static char *print_binder_ref(char *buf, char *end, struct binder_ref *ref)
+3251,3253c3275,3280
+< 	seq_printf(m, "  ref %d: desc %d %snode %d s %d w %d d %p\n",
+< 		   ref->debug_id, ref->desc, ref->node->proc ? "" : "dead ",
+< 		   ref->node->debug_id, ref->strong, ref->weak, ref->death);
+---
+> 	buf += snprintf(buf, end - buf,
+> 			"  ref %d: desc %d %snode %d s %d w %d d %p\n",
+> 			ref->debug_id, ref->desc,
+> 			ref->node->proc ? "" : "dead ", ref->node->debug_id,
+> 			ref->strong, ref->weak, ref->death);
+> 	return buf;
+3256,3257c3283,3284
+< static void print_binder_proc(struct seq_file *m,
+< 			      struct binder_proc *proc, int print_all)
+---
+> static char *print_binder_proc(char *buf, char *end,
+> 			       struct binder_proc *proc, int print_all)
+3261,3262c3288,3289
+< 	size_t start_pos = m->count;
+< 	size_t header_pos;
+---
+> 	char *start_buf = buf;
+> 	char *header_buf;
+3264,3265c3291,3292
+< 	seq_printf(m, "proc %d\n", proc->pid);
+< 	header_pos = m->count;
+---
+> 	buf += snprintf(buf, end - buf, "proc %d\n", proc->pid);
+> 	header_buf = buf;
+3267,3270c3294,3302
+< 	for (n = rb_first(&proc->threads); n != NULL; n = rb_next(n))
+< 		print_binder_thread(m, rb_entry(n, struct binder_thread,
+< 						rb_node), print_all);
+< 	for (n = rb_first(&proc->nodes); n != NULL; n = rb_next(n)) {
+---
+> 	for (n = rb_first(&proc->threads);
+> 	     n != NULL && buf < end;
+> 	     n = rb_next(n))
+> 		buf = print_binder_thread(buf, end,
+> 					  rb_entry(n, struct binder_thread,
+> 						   rb_node), print_all);
+> 	for (n = rb_first(&proc->nodes);
+> 	     n != NULL && buf < end;
+> 	     n = rb_next(n)) {
+3274c3306
+< 			print_binder_node(m, node);
+---
+> 			buf = print_binder_node(buf, end, node);
+3278c3310
+< 		     n != NULL;
+---
+> 		     n != NULL && buf < end;
+3280,3281c3312,3326
+< 			print_binder_ref(m, rb_entry(n, struct binder_ref,
+< 						     rb_node_desc));
+---
+> 			buf = print_binder_ref(buf, end,
+> 					       rb_entry(n, struct binder_ref,
+> 							rb_node_desc));
+> 	}
+> 	for (n = rb_first(&proc->allocated_buffers);
+> 	     n != NULL && buf < end;
+> 	     n = rb_next(n))
+> 		buf = print_binder_buffer(buf, end, "  buffer",
+> 					  rb_entry(n, struct binder_buffer,
+> 						   rb_node));
+> 	list_for_each_entry(w, &proc->todo, entry) {
+> 		if (buf >= end)
+> 			break;
+> 		buf = print_binder_work(buf, end, "  ",
+> 					"  pending transaction", w);
+3283,3287d3327
+< 	for (n = rb_first(&proc->allocated_buffers); n != NULL; n = rb_next(n))
+< 		print_binder_buffer(m, "  buffer",
+< 				    rb_entry(n, struct binder_buffer, rb_node));
+< 	list_for_each_entry(w, &proc->todo, entry)
+< 		print_binder_work(m, "  ", "  pending transaction", w);
+3289c3329,3332
+< 		seq_puts(m, "  has delivered dead binder\n");
+---
+> 		if (buf >= end)
+> 			break;
+> 		buf += snprintf(buf, end - buf,
+> 				"  has delivered dead binder\n");
+3292,3293c3335,3337
+< 	if (!print_all && m->count == header_pos)
+< 		m->count = start_pos;
+---
+> 	if (!print_all && buf == header_buf)
+> 		buf = start_buf;
+> 	return buf;
+3347,3348c3391,3392
+< static void print_binder_stats(struct seq_file *m, const char *prefix,
+< 			       struct binder_stats *stats)
+---
+> static char *print_binder_stats(char *buf, char *end, const char *prefix,
+> 				struct binder_stats *stats)
+3353c3397
+< 		     ARRAY_SIZE(binder_command_strings));
+---
+> 			ARRAY_SIZE(binder_command_strings));
+3356,3357c3400,3404
+< 			seq_printf(m, "%s%s: %d\n", prefix,
+< 				   binder_command_strings[i], stats->bc[i]);
+---
+> 			buf += snprintf(buf, end - buf, "%s%s: %d\n", prefix,
+> 					binder_command_strings[i],
+> 					stats->bc[i]);
+> 		if (buf >= end)
+> 			return buf;
+3361c3408
+< 		     ARRAY_SIZE(binder_return_strings));
+---
+> 			ARRAY_SIZE(binder_return_strings));
+3364,3365c3411,3414
+< 			seq_printf(m, "%s%s: %d\n", prefix,
+< 				   binder_return_strings[i], stats->br[i]);
+---
+> 			buf += snprintf(buf, end - buf, "%s%s: %d\n", prefix,
+> 					binder_return_strings[i], stats->br[i]);
+> 		if (buf >= end)
+> 			return buf;
+3369c3418
+< 		     ARRAY_SIZE(binder_objstat_strings));
+---
+> 			ARRAY_SIZE(binder_objstat_strings));
+3371c3420
+< 		     ARRAY_SIZE(stats->obj_deleted));
+---
+> 			ARRAY_SIZE(stats->obj_deleted));
+3374,3377c3423,3430
+< 			seq_printf(m, "%s%s: active %d total %d\n", prefix,
+< 				binder_objstat_strings[i],
+< 				stats->obj_created[i] - stats->obj_deleted[i],
+< 				stats->obj_created[i]);
+---
+> 			buf += snprintf(buf, end - buf,
+> 					"%s%s: active %d total %d\n", prefix,
+> 					binder_objstat_strings[i],
+> 					stats->obj_created[i] -
+> 						stats->obj_deleted[i],
+> 					stats->obj_created[i]);
+> 		if (buf >= end)
+> 			return buf;
+3378a3432
+> 	return buf;
+3381,3382c3435,3436
+< static void print_binder_proc_stats(struct seq_file *m,
+< 				    struct binder_proc *proc)
+---
+> static char *print_binder_proc_stats(char *buf, char *end,
+> 				     struct binder_proc *proc)
+3388c3442,3444
+< 	seq_printf(m, "proc %d\n", proc->pid);
+---
+> 	buf += snprintf(buf, end - buf, "proc %d\n", proc->pid);
+> 	if (buf >= end)
+> 		return buf;
+3392,3393c3448,3451
+< 	seq_printf(m, "  threads: %d\n", count);
+< 	seq_printf(m, "  requested threads: %d+%d/%d\n"
+---
+> 	buf += snprintf(buf, end - buf, "  threads: %d\n", count);
+> 	if (buf >= end)
+> 		return buf;
+> 	buf += snprintf(buf, end - buf, "  requested threads: %d+%d/%d\n"
+3397a3456,3457
+> 	if (buf >= end)
+> 		return buf;
+3401c3461,3463
+< 	seq_printf(m, "  nodes: %d\n", count);
+---
+> 	buf += snprintf(buf, end - buf, "  nodes: %d\n", count);
+> 	if (buf >= end)
+> 		return buf;
+3412c3474,3477
+< 	seq_printf(m, "  refs: %d s %d w %d\n", count, strong, weak);
+---
+> 	buf += snprintf(buf, end - buf, "  refs: %d s %d w %d\n",
+> 			count, strong, weak);
+> 	if (buf >= end)
+> 		return buf;
+3417c3482,3484
+< 	seq_printf(m, "  buffers: %d\n", count);
+---
+> 	buf += snprintf(buf, end - buf, "  buffers: %d\n", count);
+> 	if (buf >= end)
+> 		return buf;
+3429c3496,3500
+< 	seq_printf(m, "  pending transactions: %d\n", count);
+---
+> 	buf += snprintf(buf, end - buf, "  pending transactions: %d\n", count);
+> 	if (buf >= end)
+> 		return buf;
+> 
+> 	buf = print_binder_stats(buf, end, "  ", &proc->stats);
+3431c3502
+< 	print_binder_stats(m, "  ", &proc->stats);
+---
+> 	return buf;
+3435c3506,3507
+< static int binder_state_show(struct seq_file *m, void *unused)
+---
+> static int binder_read_proc_state(char *page, char **start, off_t off,
+> 				  int count, int *eof, void *data)
+3439a3512,3514
+> 	int len = 0;
+> 	char *buf = page;
+> 	char *end = page + PAGE_SIZE;
+3441a3517,3519
+> 	if (off)
+> 		return 0;
+> 
+3445c3523
+< 	seq_puts(m, "binder state:\n");
+---
+> 	buf += snprintf(buf, end - buf, "binder state:\n");
+3448,3450c3526,3531
+< 		seq_puts(m, "dead nodes:\n");
+< 	hlist_for_each_entry(node, pos, &binder_dead_nodes, dead_node)
+< 		print_binder_node(m, node);
+---
+> 		buf += snprintf(buf, end - buf, "dead nodes:\n");
+> 	hlist_for_each_entry(node, pos, &binder_dead_nodes, dead_node) {
+> 		if (buf >= end)
+> 			break;
+> 		buf = print_binder_node(buf, end, node);
+> 	}
+3452,3453c3533,3537
+< 	hlist_for_each_entry(proc, pos, &binder_procs, proc_node)
+< 		print_binder_proc(m, proc, 1);
+---
+> 	hlist_for_each_entry(proc, pos, &binder_procs, proc_node) {
+> 		if (buf >= end)
+> 			break;
+> 		buf = print_binder_proc(buf, end, proc, 1);
+> 	}
+3456c3540,3551
+< 	return 0;
+---
+> 	if (buf > page + PAGE_SIZE)
+> 		buf = page + PAGE_SIZE;
+> 
+> 	*start = page + off;
+> 
+> 	len = buf - page;
+> 	if (len > off)
+> 		len -= off;
+> 	else
+> 		len = 0;
+> 
+> 	return len < count ? len  : count;
+3459c3554,3555
+< static int binder_stats_show(struct seq_file *m, void *unused)
+---
+> static int binder_read_proc_stats(char *page, char **start, off_t off,
+> 				  int count, int *eof, void *data)
+3462a3559,3560
+> 	int len = 0;
+> 	char *p = page;
+3464a3563,3565
+> 	if (off)
+> 		return 0;
+> 
+3468c3569
+< 	seq_puts(m, "binder stats:\n");
+---
+> 	p += snprintf(p, PAGE_SIZE, "binder stats:\n");
+3470c3571
+< 	print_binder_stats(m, "", &binder_stats);
+---
+> 	p = print_binder_stats(p, page + PAGE_SIZE, "", &binder_stats);
+3472,3473c3573,3577
+< 	hlist_for_each_entry(proc, pos, &binder_procs, proc_node)
+< 		print_binder_proc_stats(m, proc);
+---
+> 	hlist_for_each_entry(proc, pos, &binder_procs, proc_node) {
+> 		if (p >= page + PAGE_SIZE)
+> 			break;
+> 		p = print_binder_proc_stats(p, page + PAGE_SIZE, proc);
+> 	}
+3476c3580,3591
+< 	return 0;
+---
+> 	if (p > page + PAGE_SIZE)
+> 		p = page + PAGE_SIZE;
+> 
+> 	*start = page + off;
+> 
+> 	len = p - page;
+> 	if (len > off)
+> 		len -= off;
+> 	else
+> 		len = 0;
+> 
+> 	return len < count ? len  : count;
+3479c3594,3595
+< static int binder_transactions_show(struct seq_file *m, void *unused)
+---
+> static int binder_read_proc_transactions(char *page, char **start, off_t off,
+> 					 int count, int *eof, void *data)
+3482a3599,3601
+> 	int len = 0;
+> 	char *buf = page;
+> 	char *end = page + PAGE_SIZE;
+3484a3604,3606
+> 	if (off)
+> 		return 0;
+> 
+3488,3490c3610,3615
+< 	seq_puts(m, "binder transactions:\n");
+< 	hlist_for_each_entry(proc, pos, &binder_procs, proc_node)
+< 		print_binder_proc(m, proc, 0);
+---
+> 	buf += snprintf(buf, end - buf, "binder transactions:\n");
+> 	hlist_for_each_entry(proc, pos, &binder_procs, proc_node) {
+> 		if (buf >= end)
+> 			break;
+> 		buf = print_binder_proc(buf, end, proc, 0);
+> 	}
+3493c3618,3629
+< 	return 0;
+---
+> 	if (buf > page + PAGE_SIZE)
+> 		buf = page + PAGE_SIZE;
+> 
+> 	*start = page + off;
+> 
+> 	len = buf - page;
+> 	if (len > off)
+> 		len -= off;
+> 	else
+> 		len = 0;
+> 
+> 	return len < count ? len  : count;
+3496c3632,3633
+< static int binder_proc_show(struct seq_file *m, void *unused)
+---
+> static int binder_read_proc_proc(char *page, char **start, off_t off,
+> 				 int count, int *eof, void *data)
+3498c3635,3637
+< 	struct binder_proc *proc = m->private;
+---
+> 	struct binder_proc *proc = data;
+> 	int len = 0;
+> 	char *p = page;
+3500a3640,3642
+> 	if (off)
+> 		return 0;
+> 
+3503,3504c3645,3646
+< 	seq_puts(m, "binder proc state:\n");
+< 	print_binder_proc(m, proc, 1);
+---
+> 	p += snprintf(p, PAGE_SIZE, "binder proc state:\n");
+> 	p = print_binder_proc(p, page + PAGE_SIZE, proc, 1);
+3507c3649,3660
+< 	return 0;
+---
+> 
+> 	if (p > page + PAGE_SIZE)
+> 		p = page + PAGE_SIZE;
+> 	*start = page + off;
+> 
+> 	len = p - page;
+> 	if (len > off)
+> 		len -= off;
+> 	else
+> 		len = 0;
+> 
+> 	return len < count ? len  : count;
+3510c3663
+< static void print_binder_transaction_log_entry(struct seq_file *m,
+---
+> static char *print_binder_transaction_log_entry(char *buf, char *end,
+3513,3518c3666,3673
+< 	seq_printf(m,
+< 		   "%d: %s from %d:%d to %d:%d node %d handle %d size %d:%d\n",
+< 		   e->debug_id, (e->call_type == 2) ? "reply" :
+< 		   ((e->call_type == 1) ? "async" : "call "), e->from_proc,
+< 		   e->from_thread, e->to_proc, e->to_thread, e->to_node,
+< 		   e->target_handle, e->data_size, e->offsets_size);
+---
+> 	buf += snprintf(buf, end - buf,
+> 			"%d: %s from %d:%d to %d:%d node %d handle %d "
+> 			"size %d:%d\n",
+> 			e->debug_id, (e->call_type == 2) ? "reply" :
+> 			((e->call_type == 1) ? "async" : "call "), e->from_proc,
+> 			e->from_thread, e->to_proc, e->to_thread, e->to_node,
+> 			e->target_handle, e->data_size, e->offsets_size);
+> 	return buf;
+3521c3676,3677
+< static int binder_transaction_log_show(struct seq_file *m, void *unused)
+---
+> static int binder_read_proc_transaction_log(
+> 	char *page, char **start, off_t off, int count, int *eof, void *data)
+3523c3679,3680
+< 	struct binder_transaction_log *log = m->private;
+---
+> 	struct binder_transaction_log *log = data;
+> 	int len = 0;
+3524a3682,3686
+> 	char *buf = page;
+> 	char *end = page + PAGE_SIZE;
+> 
+> 	if (off)
+> 		return 0;
+3527,3528c3689,3694
+< 		for (i = log->next; i < ARRAY_SIZE(log->entry); i++)
+< 			print_binder_transaction_log_entry(m, &log->entry[i]);
+---
+> 		for (i = log->next; i < ARRAY_SIZE(log->entry); i++) {
+> 			if (buf >= end)
+> 				break;
+> 			buf = print_binder_transaction_log_entry(buf, end,
+> 								&log->entry[i]);
+> 		}
+3530,3532c3696,3711
+< 	for (i = 0; i < log->next; i++)
+< 		print_binder_transaction_log_entry(m, &log->entry[i]);
+< 	return 0;
+---
+> 	for (i = 0; i < log->next; i++) {
+> 		if (buf >= end)
+> 			break;
+> 		buf = print_binder_transaction_log_entry(buf, end,
+> 							 &log->entry[i]);
+> 	}
+> 
+> 	*start = page + off;
+> 
+> 	len = buf - page;
+> 	if (len > off)
+> 		len -= off;
+> 	else
+> 		len = 0;
+> 
+> 	return len < count ? len  : count;
+3551,3555d3729
+< BINDER_DEBUG_ENTRY(state);
+< BINDER_DEBUG_ENTRY(stats);
+< BINDER_DEBUG_ENTRY(transactions);
+< BINDER_DEBUG_ENTRY(transaction_log);
+< 
+3564,3567c3738,3741
+< 	binder_debugfs_dir_entry_root = debugfs_create_dir("binder", NULL);
+< 	if (binder_debugfs_dir_entry_root)
+< 		binder_debugfs_dir_entry_proc = debugfs_create_dir("proc",
+< 						 binder_debugfs_dir_entry_root);
+---
+> 	binder_proc_dir_entry_root = proc_mkdir("binder", NULL);
+> 	if (binder_proc_dir_entry_root)
+> 		binder_proc_dir_entry_proc = proc_mkdir("proc",
+> 						binder_proc_dir_entry_root);
+3569,3594c3743,3768
+< 	if (binder_debugfs_dir_entry_root) {
+< 		debugfs_create_file("state",
+< 				    S_IRUGO,
+< 				    binder_debugfs_dir_entry_root,
+< 				    NULL,
+< 				    &binder_state_fops);
+< 		debugfs_create_file("stats",
+< 				    S_IRUGO,
+< 				    binder_debugfs_dir_entry_root,
+< 				    NULL,
+< 				    &binder_stats_fops);
+< 		debugfs_create_file("transactions",
+< 				    S_IRUGO,
+< 				    binder_debugfs_dir_entry_root,
+< 				    NULL,
+< 				    &binder_transactions_fops);
+< 		debugfs_create_file("transaction_log",
+< 				    S_IRUGO,
+< 				    binder_debugfs_dir_entry_root,
+< 				    &binder_transaction_log,
+< 				    &binder_transaction_log_fops);
+< 		debugfs_create_file("failed_transaction_log",
+< 				    S_IRUGO,
+< 				    binder_debugfs_dir_entry_root,
+< 				    &binder_transaction_log_failed,
+< 				    &binder_transaction_log_fops);
+---
+> 	if (binder_proc_dir_entry_root) {
+> 		create_proc_read_entry("state",
+> 				       S_IRUGO,
+> 				       binder_proc_dir_entry_root,
+> 				       binder_read_proc_state,
+> 				       NULL);
+> 		create_proc_read_entry("stats",
+> 				       S_IRUGO,
+> 				       binder_proc_dir_entry_root,
+> 				       binder_read_proc_stats,
+> 				       NULL);
+> 		create_proc_read_entry("transactions",
+> 				       S_IRUGO,
+> 				       binder_proc_dir_entry_root,
+> 				       binder_read_proc_transactions,
+> 				       NULL);
+> 		create_proc_read_entry("transaction_log",
+> 				       S_IRUGO,
+> 				       binder_proc_dir_entry_root,
+> 				       binder_read_proc_transaction_log,
+> 				       &binder_transaction_log);
+> 		create_proc_read_entry("failed_transaction_log",
+> 				       S_IRUGO,
+> 				       binder_proc_dir_entry_root,
+> 				       binder_read_proc_transaction_log,
+> 				       &binder_transaction_log_failed);
+diff -r ./drivers/staging/Kconfig ../../Kernel/drivers/staging/Kconfig
+128d127
+< source "drivers/staging/zram/Kconfig"
+Seulement dans ./drivers/staging: Kconfig~
+diff -r ./drivers/staging/Makefile ../../Kernel/drivers/staging/Makefile
+47d46
+< obj-$(CONFIG_ZRAM)    += zram/
+Seulement dans ./drivers/staging: Makefile~
+Seulement dans ./drivers/staging: zram
+Seulement dans ../../Kernel/drivers: storage
+Seulement dans ./drivers: storage_mtd
+diff -r ./drivers/svnet/Makefile ../../Kernel/drivers/svnet/Makefile
+10c10
+< obj-y	+= svnet.o
+---
+> obj-m	+= svnet.o
+Seulement dans ./drivers/svnet: Makefile~
+diff -r ./drivers/svnet/sipc4.c ../../Kernel/drivers/svnet/sipc4.c
+207c207
+< unsigned long pdp_bitmap[DIV_ROUND_UP(PDP_MAX, BITS_PER_LONG)];
+---
+> unsigned long pdp_bitmap[PDP_MAX/BITS_PER_LONG];
+Seulement dans ../../Kernel/drivers/tfsr: built-in.o
+Seulement dans ../../Kernel/drivers/tfsr: .built-in.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/Core/BML: FSR_BML_BBMCommon.o
+Seulement dans ../../Kernel/drivers/tfsr/Core/BML: .FSR_BML_BBMCommon.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/Core/BML: FSR_BML_BBMMount.o
+Seulement dans ../../Kernel/drivers/tfsr/Core/BML: .FSR_BML_BBMMount.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/Core/BML: FSR_BML_BIFCommon.o
+Seulement dans ../../Kernel/drivers/tfsr/Core/BML: .FSR_BML_BIFCommon.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/Core/BML: FSR_BML_ROInterface.o
+Seulement dans ../../Kernel/drivers/tfsr/Core/BML: .FSR_BML_ROInterface.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/LLD/FlexOND: FSR_LLD_FlexOND.o
+Seulement dans ../../Kernel/drivers/tfsr/LLD/FlexOND: .FSR_LLD_FlexOND.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/LLD/OND: FSR_LLD_4K_OneNAND.o
+Seulement dans ../../Kernel/drivers/tfsr/LLD/OND: .FSR_LLD_4K_OneNAND.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/LLD/OND: FSR_LLD_OneNAND.o
+Seulement dans ../../Kernel/drivers/tfsr/LLD/OND: .FSR_LLD_OneNAND.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/LLD/OND: FSR_LLD_SWEcc.o
+Seulement dans ../../Kernel/drivers/tfsr/LLD/OND: .FSR_LLD_SWEcc.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/Misc: FSR_DBG_Zone.o
+Seulement dans ../../Kernel/drivers/tfsr/Misc: .FSR_DBG_Zone.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/Misc: FSR_Version.o
+Seulement dans ../../Kernel/drivers/tfsr/Misc: .FSR_Version.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr: modules.order
+Seulement dans ../../Kernel/drivers/tfsr/OAM/Linux: FSR_OAM_Linux.o
+Seulement dans ../../Kernel/drivers/tfsr/OAM/Linux: .FSR_OAM_Linux.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/PAM/Poseidon: FSR_PAM_asm.o
+Seulement dans ../../Kernel/drivers/tfsr/PAM/Poseidon: .FSR_PAM_asm.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/PAM/Poseidon: FSR_PAM_Poseidon.o
+Seulement dans ../../Kernel/drivers/tfsr/PAM/Poseidon: .FSR_PAM_Poseidon.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/PAM/s5p6442: FSR_PAM_asm.o
+Seulement dans ../../Kernel/drivers/tfsr/PAM/s5p6442: .FSR_PAM_asm.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr/PAM/s5p6442: FSR_PAM_s5p6442.o
+Seulement dans ../../Kernel/drivers/tfsr/PAM/s5p6442: .FSR_PAM_s5p6442.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr: tfsr_base.o
+Seulement dans ../../Kernel/drivers/tfsr: .tfsr_base.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr: tfsr_blkdev.o
+Seulement dans ../../Kernel/drivers/tfsr: .tfsr_blkdev.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr: tfsr_block.o
+Seulement dans ../../Kernel/drivers/tfsr: .tfsr_block.o.cmd
+Seulement dans ../../Kernel/drivers/tfsr: tfsr.o
+Seulement dans ../../Kernel/drivers/tfsr: .tfsr.o.cmd
+diff -r ./drivers/usb/gadget/f_mass_storage.c ../../Kernel/drivers/usb/gadget/f_mass_storage.c
+82,84c82
+< extern int apollo_get_hw_type(void);
+< 
+< //#define DEBUG_FSG_LOCK 			0
+---
+> #define DEBUG_FSG_LOCK 			0
+1378d1375
+<         char product_id[14];
+1385,1393c1382,1383
+< //#ifdef CONFIG_GT5801
+< //	static char product_id[] = "GT-I5800 Card";
+< //#else
+< //	static char product_id[] = "GT-I5801 Card";
+< //#endif
+<         if(apollo_get_hw_type()) // GT-I5800
+<           strcpy(product_id, "GT-I5800 Card");
+<         else // GT-I5801
+<           strcpy(product_id, "GT-I5801 Card");
+---
+> 	static char product_id[] = "GT-I5800 Card";
+> 
+diff -r ./drivers/usb/gadget/fsa9480_i2c.c ../../Kernel/drivers/usb/gadget/fsa9480_i2c.c
+341c341
+< #if 0
+---
+> #if 1
+1100c1100
+< 				return sprintf(buf, "%s\n", "online");
+---
+> 				return sprintf(buf, "%s\n", "ums online");
+1113c1113
+< 			return sprintf(buf, "%s\n", "offline");
+---
+> 			return sprintf(buf, "%s\n", "ums offline");
+1117c1117
+< 			return sprintf(buf, "%s\n", "offline");
+---
+> 			return sprintf(buf, "%s\n", "ums offline");
+diff -r ./drivers/video/fbmem.c ../../Kernel/drivers/video/fbmem.c
+1371a1372,1375
+> #ifdef CONFIG_FB_S3C
+> extern void s3cfb_stop_progress(void);
+> #endif
+> 
+1402a1407,1409
+> #endif
+> #ifdef CONFIG_FB_S3C
+> 	s3cfb_stop_progress();
+diff -r ./drivers/video/samsung/s3cfb.c ../../Kernel/drivers/video/samsung/s3cfb.c
+90,91c90,91
+< void s3cfb_early_suspend(struct early_suspend *h);
+< void s3cfb_late_resume(struct early_suspend *h);
+---
+> int s3cfb_early_suspend(struct early_suspend *h);
+> int s3cfb_late_resume(struct early_suspend *h);
+106,107c106,107
+< //	struct fb_fix_screeninfo *fix = &fb->fix;
+< //	struct fb_var_screeninfo *var = &fb->var;
+---
+> 	struct fb_fix_screeninfo *fix = &fb->fix;
+> 	struct fb_var_screeninfo *var = &fb->var;
+1331c1331
+< 	frame_buf_mark.p_fb = (void *)fbdev->fb[0]->fix.smem_start;
+---
+> 	frame_buf_mark.p_fb = fbdev->fb[0]->fix.smem_start;
+1337a1338,1342
+> //sm.kim: draw progress bar
+> #ifndef CONFIG_FRAMEBUFFER_CONSOLE
+> 	s3cfb_start_progress(fbdev, s3cfb_set_par, s3cfb_release_window);
+> #endif 
+> 
+1531c1536
+< void s3cfb_early_suspend(struct early_suspend *h)
+---
+> int s3cfb_early_suspend(struct early_suspend *h)
+1544d1548
+< 
+1546a1551
+> 	return 0;
+1549c1554
+< void s3cfb_late_resume(struct early_suspend *h)
+---
+> int s3cfb_late_resume(struct early_suspend *h)
+1565a1571
+> 	return 0;
+1568c1574
+< void s3cfb_force_resume()
+---
+> int s3cfb_force_resume()
+1571c1577
+< 	{
+---
+> 		{
+1573c1579
+< 	}
+---
+> 		}
+1617c1623
+< void s3cfb_shutdown(struct platform_device *pdev)
+---
+> int s3cfb_shutdown(struct platform_device *pdev)
+1620a1627
+> 	return 0;
+diff -r ./drivers/video/samsung/s3cfb_fimd6x.c ../../Kernel/drivers/video/samsung/s3cfb_fimd6x.c
+307c307
+< //	struct s3c_platform_fb *pdata = to_fb_plat(ctrl->dev);
+---
+> 	struct s3c_platform_fb *pdata = to_fb_plat(ctrl->dev);
+diff -r ./drivers/video/samsung/s3cfb.h ../../Kernel/drivers/video/samsung/s3cfb.h
+23,24d22
+< void s3cfb_force_resume(void);
+< 
+317a316,317
+> //sm.kim 2009.12.14 for progress bar while kernel booting
+> extern void s3cfb_start_progress(struct s3cfb_global* ctrl, int (*func_allocfb)(struct fb_info *), int (*func_releasefb)(struct fb_info *));
+diff -r ./drivers/video/samsung/s3cfb_s6d04d1.c ../../Kernel/drivers/video/samsung/s3cfb_s6d04d1.c
+35c35
+< extern int apollo_get_saved_lcd_id_value(void);
+---
+> extern int apollo_get_saved_lcd_id_value();
+37c37
+< extern void s3cfb_force_resume(void);
+---
+> extern int s3cfb_force_resume();
+40c40
+< //static int s6d04d1_init(void);
+---
+> static int s6d04d1_init(void);
+486a487
+> 	printk("ldi mtpdata: %x %x %x\n", data[0], data[1], data[2]);
+489a491
+> 		printk(KERN_NOTICE "lcd type is smd\n");
+493a496
+> 		printk(KERN_NOTICE "lcd type is sony\n");
+497a501
+> 		printk(KERN_WARNING "lcd type is none(lcd may be absent)\n");
+501a506
+> 		printk(KERN_NOTICE "default lcd type is smd\n");
+515,516c520,521
+< //	u8 data;
+< //	u8 mtpdata[4];
+---
+> 	u8 data;
+> 	u8 mtpdata[4];
+523a529
+> 			printk("s3cfb force resume!\n");
+578a585
+> 		printk("%s brightness:0x%x\n", __func__, backlight_level);
+717c724
+< #if 0
+---
+> 
+720a728
+>     printk("#####################  %s : START ##################\n",__FUNCTION__);
+741c749
+< #endif
+---
+> 
+743a752
+> 	printk("#####%s: value %d \n", __FUNCTION__, value);
+759a769
+> 	printk("#####%s: value %d \n", __FUNCTION__, value); 
+815c825
+< //static s32 s6d04d1_backlight_brightness = S6D04D1_DEFAULT_BACKLIGHT_BRIGHTNESS;
+---
+> static s32 s6d04d1_backlight_brightness = S6D04D1_DEFAULT_BACKLIGHT_BRIGHTNESS;
+820a831
+> 	printk(KERN_INFO "#####%s: value %d \n", __FUNCTION__, value);
+838a850
+> 	printk ( "@@@@@     %s : value %d\n", __func__, value );
+921,922c933
+< 
+< 	};
+---
+> 	} rgb565_data;
+929c940
+< 	};
+---
+> 	} rgb888_data;
+960a972,1147
+> }
+> 
+> 
+> #include "s3cfb_progress.h"
+> 
+> #define PROGRESS_WIN_NUM	1
+> 
+> static int progress = 0;
+> 
+> static int progress_flag = OFF;
+> 
+> static struct timer_list progress_timer;
+> 
+> static struct s3cfb_global *fb_ctrl = NULL;
+> 
+> static int (*allocfb)(struct fb_info *) = NULL;
+> static int (*releasefb)(struct fb_info *) = NULL;
+> 
+> static void progress_timer_handler(unsigned long data)
+> {
+> #if 0
+> 	struct fb_info *fbinfo;
+> 	unsigned short *bar_src, *bar_dst;	
+> 	int	i, j, p;
+> 
+> 	if(!fb_ctrl)
+> 		return;
+> 	fbinfo = fb_ctrl->fb[PROGRESS_WIN_NUM];
+> 		
+> 	/* 1 * 8 R5G5B5 BMP (Aligned 4 Bytes) */
+> 	bar_dst = (unsigned short *)(fbinfo->screen_base + (((240 * 347) + 31) * 2));
+> 	bar_src = (unsigned short *)(progress_bar + sizeof(progress_bar) - 4);
+> 
+> 	for (i = 0; i < 8; i++) {
+> 		for (j = 0; j < 2; j++) {
+> 			p = ((240 * i) + (progress * 2) + j);
+> 			*(bar_dst + p) = (*(bar_src - (i * 2)) | 0x8000);
+> 		}
+> 	}	
+> 
+> 	progress++;
+> 
+> 	if (progress > 88) {
+> 		del_timer(&progress_timer);
+> 	}
+> 	else {
+> 		progress_timer.expires = (get_jiffies_64() + data); 
+> 		progress_timer.function = progress_timer_handler; 
+> 		add_timer(&progress_timer);
+> 	}
+> #endif
+> }
+> 
+> void s3cfb_restart_progress()
+> {
+> #if 0
+> 	struct fb_info *fbinfo;
+> 	unsigned short *bg_src, *bg_dst;	
+> 	unsigned short *bar_src, *bar_dst;	
+> 	int	i, j, p;
+> 
+> 	if (progress_flag == OFF)
+> 		return;
+> 	
+> 	if(!fb_ctrl)
+> 		return;
+> 	fbinfo = fb_ctrl->fb[PROGRESS_WIN_NUM];
+> 	
+> 	del_timer(&progress_timer);
+> 
+> 	/* 240 * 19 R5G5B5 BMP */
+> 	bg_dst = (unsigned short *)(fbinfo->screen_base + ((240 * 342) * 2));
+> 	bg_src = (unsigned short *)(progress_bg + sizeof(progress_bg) - 2);
+> 
+> 	for (i = 0; i < 19; i++) {
+> 		for (j = 0; j < 240; j++) {
+> 			p = ((240 * i) + j);
+> 			if ((*(bg_src - p) & 0x7FFF) == 0x0000)
+> 				*(bg_dst + p) = (*(bg_src - p) & ~0x8000);
+> 			else
+> 				*(bg_dst + p) = (*(bg_src - p) | 0x8000);
+> 		}
+> 	}
+> 
+> 	progress = 0;
+> 
+> 	progress_timer.expires = (get_jiffies_64() + (HZ/1)); 
+> 	progress_timer.function = progress_timer_handler; 
+> 	progress_timer.data = (HZ/3);
+> 	add_timer(&progress_timer);
+> #endif
+> }
+> EXPORT_SYMBOL(s3cfb_restart_progress);
+> 
+> static unsigned int new_wincon1; 
+> static unsigned int old_wincon1; 
+> static unsigned int new_vidosd1c; 
+> static unsigned int old_vidosd1c; 
+> 
+> void s3cfb_start_progress(struct s3cfb_global* ctrl, int (*func_allocfb)(struct fb_info *), int (*func_releasefb)(struct fb_info *))
+> {
+> #if 0
+> 	struct fb_info *fbinfo = ctrl->fb[PROGRESS_WIN_NUM];
+> 	unsigned short *bg_src, *bg_dst;	
+> 	unsigned int data;
+> 	int	i, j, p;
+> 
+> 	// save arguments //
+> 	fb_ctrl = ctrl;
+> 	allocfb = func_allocfb;
+> 	releasefb =func_releasefb;
+> 
+> 	func_allocfb(fbinfo);
+> 	memset(fbinfo->screen_base, 0x00, LOGO_MEM_SIZE);	
+> 
+> 	/* 240 * 19 R5G5B5 BMP */
+> 	bg_dst = (unsigned short *)(fbinfo->screen_base + ((240 * 342) * 2));
+> 	bg_src = (unsigned short *)(progress_bg + sizeof(progress_bg) - 2);
+> 
+> 	for (i = 0; i < 19; i++) {
+> 		for (j = 0; j < 240; j++) {
+> 			p = ((240 * i) + j);
+> 			if ((*(bg_src - p) & 0x7FFF) == 0x0000)
+> 				*(bg_dst + p) = (*(bg_src - p) & ~0x8000);
+> 			else
+> 				*(bg_dst + p) = (*(bg_src - p) | 0x8000);
+> 		}
+> 	}
+> 
+> 	old_wincon1  = readl(ctrl->regs + S3C_WINCON(PROGRESS_WIN_NUM));
+> 	old_vidosd1c = readl(ctrl->regs + S3C_VIDOSD_C(PROGRESS_WIN_NUM));
+> 
+> 	new_wincon1 = S3C_WINCON_DATAPATH_DMA | S3C_WINCON_BUFSEL_0 | S3C_WINCON_BUFAUTO_DISABLE | \
+> 	              S3C_WINCON_BITSWP_DISABLE | S3C_WINCON_BYTESWP_DISABLE | S3C_WINCON_HAWSWP_ENABLE | \
+> 	              S3C_WINCON_BURSTLEN_16WORD | S3C_WINCON_BLD_PIXEL | S3C_WINCON_BPPMODE_16BPP_A555 | \
+> 	              S3C_WINCON_ALPHA0_SEL | S3C_WINCON_ENWIN_ENABLE ;
+> 	
+> 	new_vidosd1c = S3C_VIDOSD_ALPHA1_R(0xF)|S3C_VIDOSD_ALPHA1_G(0xF)|S3C_VIDOSD_ALPHA1_B(0xF);
+> 
+> 	data = readl(ctrl->regs + S3C_WINSHMAP);
+> 	data |= (1<<PROGRESS_WIN_NUM);
+> 	writel(data, ctrl->regs + S3C_WINSHMAP);
+> 	
+> 	writel(new_vidosd1c, ctrl->regs + S3C_VIDOSD_C(PROGRESS_WIN_NUM));
+> 	writel(new_wincon1, ctrl->regs + S3C_WINCON(PROGRESS_WIN_NUM));
+> 
+> 	init_timer(&progress_timer);
+> 	progress_timer.expires = (get_jiffies_64() + (HZ/10)); 
+> 	progress_timer.function = progress_timer_handler; 
+> 	progress_timer.data = (HZ/15);
+> 	add_timer(&progress_timer);
+> 
+> 	progress_flag = ON;
+> #endif
+> }
+> 
+> 
+> void s3cfb_stop_progress(void)
+> {
+> #if 0
+> 	if (progress_flag == OFF)
+> 		return;
+> 
+> 	del_timer(&progress_timer);
+> 
+> 	if(fb_ctrl)
+> 	{
+> 		writel(old_wincon1, fb_ctrl->regs + S3C_WINCON(PROGRESS_WIN_NUM));
+> 		writel(old_vidosd1c, fb_ctrl->regs + S3C_VIDOSD_C(PROGRESS_WIN_NUM));
+> 	}
+> 		
+> 	if(releasefb)
+> 		releasefb(fb_ctrl->fb[PROGRESS_WIN_NUM]);
+> 	
+> 	progress_flag = OFF;
+> #endif
+diff -r ./fs/open.c ../../Kernel/fs/open.c
+1031c1031
+< long do_sys_open(int dfd, const char /*__user*/ *filename, int flags, int mode)
+---
+> long do_sys_open(int dfd, const char __user *filename, int flags, int mode)
+1053c1053
+< SYSCALL_DEFINE3(open, const char /*__user*/ *, filename, int, flags, int, mode)
+---
+> SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, int, mode)
+Seulement dans ./include: asm
+Seulement dans ./include: asm-arm
+Seulement dans ./include: config
+Seulement dans ./include/linux: autoconf.h
+diff -r ./include/linux/blkdev.h ../../Kernel/include/linux/blkdev.h
+1277d1276
+<         void (*swap_slot_free_notify) (struct block_device *, unsigned long);
+Seulement dans ./include/linux: bsearch.h
+diff -r ./include/linux/cpufreq.h ../../Kernel/include/linux/cpufreq.h
+341,343d340
+< #elif defined(CONFIG_CPU_FREQ_DEFAULT_GOV_LAGFREE)
+< extern struct cpufreq_governor cpufreq_gov_lagfree;
+< #define CPUFREQ_DEFAULT_GOVERNOR	(&cpufreq_gov_lagfree)
+diff -r ./include/linux/hardirq.h ../../Kernel/include/linux/hardirq.h
+142,164d141
+< #if defined(CONFIG_TINY_RCU)
+< extern void rcu_enter_nohz(void);
+< extern void rcu_exit_nohz(void);
+< 
+< static inline void rcu_irq_enter(void)
+< {
+<   rcu_exit_nohz();
+< }
+< 
+< static inline void rcu_irq_exit(void)
+< {
+<   rcu_enter_nohz();
+< }
+< 
+< static inline void rcu_nmi_enter(void)
+< {
+< }
+< 
+< static inline void rcu_nmi_exit(void)
+< {
+< }
+< 
+< #else
+169d145
+< #endif
+diff -r ./include/linux/init_task.h ../../Kernel/include/linux/init_task.h
+122,184d121
+< #ifdef CONFIG_SCHED_BFS
+< #define INIT_TASK(tsk) \
+< { \
+< .state = 0, \
+< .stack = &init_thread_info, \
+< .usage = ATOMIC_INIT(2), \
+< .flags = PF_KTHREAD, \
+< .lock_depth = -1, \
+< .prio = NORMAL_PRIO, \
+< .static_prio = MAX_PRIO-20, \
+< .normal_prio = NORMAL_PRIO, \
+< .deadline = 0, \
+< .policy = SCHED_NORMAL, \
+< .cpus_allowed = CPU_MASK_ALL, \
+< .mm = NULL, \
+< .active_mm = &init_mm, \
+< .run_list = LIST_HEAD_INIT(tsk.run_list), \
+< .time_slice = HZ, \
+< .tasks = LIST_HEAD_INIT(tsk.tasks), \
+< .pushable_tasks = PLIST_NODE_INIT(tsk.pushable_tasks, MAX_PRIO), \
+< .ptraced = LIST_HEAD_INIT(tsk.ptraced), \
+< .ptrace_entry = LIST_HEAD_INIT(tsk.ptrace_entry), \
+< .real_parent = &tsk, \
+< .parent = &tsk, \
+< .children = LIST_HEAD_INIT(tsk.children), \
+< .sibling = LIST_HEAD_INIT(tsk.sibling), \
+< .group_leader = &tsk, \
+< .real_cred = &init_cred, \
+< .cred = &init_cred, \
+< .cred_guard_mutex = \
+< __MUTEX_INITIALIZER(tsk.cred_guard_mutex), \
+< .comm = "swapper", \
+< .thread = INIT_THREAD, \
+< .fs = &init_fs, \
+< .files = &init_files, \
+< .signal = &init_signals, \
+< .sighand = &init_sighand, \
+< .nsproxy = &init_nsproxy, \
+< .pending = { \
+< .list = LIST_HEAD_INIT(tsk.pending.list), \
+< .signal = {{0}}}, \
+< .blocked = {{0}}, \
+< .alloc_lock = __SPIN_LOCK_UNLOCKED(tsk.alloc_lock), \
+< .journal_info = NULL, \
+< .cpu_timers = INIT_CPU_TIMERS(tsk.cpu_timers), \
+< .fs_excl = ATOMIC_INIT(0), \
+< .pi_lock = __SPIN_LOCK_UNLOCKED(tsk.pi_lock), \
+< .timer_slack_ns = 50000, /* 50 usec default slack */	\
+< .pids = { \
+< [PIDTYPE_PID] = INIT_PID_LINK(PIDTYPE_PID), \
+< [PIDTYPE_PGID] = INIT_PID_LINK(PIDTYPE_PGID), \
+< [PIDTYPE_SID] = INIT_PID_LINK(PIDTYPE_SID), \
+< }, \
+< .dirties = INIT_PROP_LOCAL_SINGLE(dirties), \
+< INIT_IDS \
+< INIT_PERF_EVENTS(tsk) \
+< INIT_TRACE_IRQFLAGS \
+< INIT_LOCKDEP \
+< INIT_FTRACE_GRAPH \
+< INIT_TRACE_RECURSION \
+< INIT_TASK_RCU_PREEMPT(tsk) \
+< }
+< #else /* CONFIG_SCHED_BFS */
+251c188
+< #endif
+---
+> 
+diff -r ./include/linux/ioprio.h ../../Kernel/include/linux/ioprio.h
+67,69d66
+< 	if (task->policy == SCHED_ISO)
+< 		return 0;
+< 
+Seulement dans ./include/linux: memcopy.h
+diff -r ./include/linux/mmc/host.h ../../Kernel/include/linux/mmc/host.h
+17d16
+< #include <linux/mmc/pm.h>
+197,198d195
+< 
+<         mmc_pm_flag_t           pm_flags;       /* requested pm features */
+Seulement dans ./include/linux/mmc: pm.h
+diff -r ./include/linux/mmc/sdio_func.h ../../Kernel/include/linux/mmc/sdio_func.h
+18,19d17
+< #include <linux/mmc/pm.h>
+< 
+diff -r ./include/linux/mm.h ../../Kernel/include/linux/mm.h
+1173c1173
+< #define VM_MAX_READAHEAD	256	/* kbytes */
+---
+> #define VM_MAX_READAHEAD	128	/* kbytes */
+diff -r ./include/linux/mmzone.h ../../Kernel/include/linux/mmzone.h
+18d17
+< #include <linux/timer.h>
+163d161
+<         WMARK_LOTS,
+170c168
+< #define lots_wmark_pages(z) (z->watermark[WMARK_LOTS])
+---
+> 
+644d641
+<         struct timer_list watermark_timer;
+Seulement dans ./include/linux/mtd: bml.h
+diff -r ./include/linux/mtd/flashchip.h ../../Kernel/include/linux/mtd/flashchip.h
+0a1
+> 
+2,8c3
+<  * Copyright Â© 2000      Red Hat UK Limited
+<  * Copyright Â© 2000-2010 David Woodhouse <dwmw2@infradead.org>
+<  *
+<  * This program is free software; you can redistribute it and/or modify
+<  * it under the terms of the GNU General Public License as published by
+<  * the Free Software Foundation; either version 2 of the License, or
+<  * (at your option) any later version.
+---
+>  * struct flchip definition
+10,17c5
+<  * This program is distributed in the hope that it will be useful,
+<  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+<  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+<  * GNU General Public License for more details.
+<  *
+<  * You should have received a copy of the GNU General Public License
+<  * along with this program; if not, write to the Free Software
+<  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+---
+>  * Contains information about the location and state of a given flash device
+18a7
+>  * (C) 2000 Red Hat. GPLd.
+29d17
+< #include <linux/mutex.h>
+53,61d40
+< 	/* These 2 come from nand_state_t, which has been unified here */
+< 	FL_READING,
+< 	FL_CACHEDPRG,
+< 	/* These 4 come from onenand_state_t, which has been unified here */
+< 	FL_RESETING,
+< 	FL_OTPING,
+< 	FL_PREPARING_ERASE,
+< 	FL_VERIFYING_ERASE,
+< 
+89c68,69
+< 	struct mutex mutex;
+---
+> 	spinlock_t *mutex;
+> 	spinlock_t _spinlock; /* We do it like this because sometimes they'll be shared. */
+106c86
+< 	struct mutex lock;
+---
+> 	spinlock_t lock;
+diff -r ./include/linux/mtd/onenand.h ../../Kernel/include/linux/mtd/onenand.h
+4c4
+<  *  Copyright Â© 2005-2009 Samsung Electronics
+---
+>  *  Copyright (C) 2005-2007 Samsung Electronics
+17d16
+< #include <linux/mtd/flashchip.h>
+28a28,43
+> /*
+>  * onenand_state_t - chip states
+>  * Enumeration for OneNAND flash chip state
+>  */
+> typedef enum {
+> 	FL_READY,
+> 	FL_READING,
+> 	FL_WRITING,
+> 	FL_ERASING,
+> 	FL_SYNCING,
+> 	FL_LOCKING,
+> 	FL_RESETING,
+> 	FL_OTPING,
+> 	FL_PM_SUSPENDED,
+> } onenand_state_t;
+> 
+71d85
+<  * @chip_probe:		[REPLACEABLE] hardware specific function for chip probe
+106d119
+< 	struct clk		*clk;
+119d131
+< 	int (*chip_probe)(struct mtd_info *mtd);
+122,123d133
+< 	int (*enable)(struct mtd_info *mtd);
+< 	int (*disable)(struct mtd_info *mtd);
+130c140
+< 	flstate_t		state;
+---
+> 	onenand_state_t		state;
+133,135d142
+< #ifdef CONFIG_MTD_ONENAND_VERIFY_WRITE
+< 	unsigned char		*verify_buf;
+< #endif
+146,153d152
+< 
+< 	/*
+< 	 * Shows that the current operation is composed
+< 	 * of sequence of commands. For example, cache program.
+< 	 * Such command status OnGo bit is checked at the end of
+< 	 * sequence.
+< 	 */
+< 	unsigned int		ongoing;
+159,160d157
+< #define ONENAND_PAGES_PER_BLOCK        (1<<6)
+< 
+184,185d180
+< #define ONENAND_NO_OOB_CMD                      ONENAND_IS_SINGLE_DATARAM
+< 
+196,198d190
+< #define ONENAND_IS_CACHE_PROGRAM(this)					\
+< 	(this->options & ONENAND_HAS_CACHE_PROGRAM)
+< 
+208d199
+< #define ONENAND_HAS_4KB_PAGE		(0x0008)
+211d201
+< #define ONENAND_HAS_CACHE_PROGRAM	(0x0010)
+215,218d204
+< #define ONENAND_SKIP_INITIAL_UNLOCKING	(0x4000)
+< 
+< #define ONENAND_IS_4KB_PAGE(this)					\
+< 	(this->options & ONENAND_HAS_4KB_PAGE)
+246,247d231
+< 	int		(*read_bufferram)(struct mtd_info *mtd, int area,
+< 			unsigned char *buffer, int offset, size_t count);
+Seulement dans ./include/linux: quickwakeup.h
+diff -r ./include/linux/rcupdate.h ../../Kernel/include/linux/rcupdate.h
+71d70
+< #ifndef CONFIG_TINY_RCU
+73,75d71
+< #else
+< static inline int rcu_needs_cpu(int cpu) { return 0; }
+< #endif
+80,81d75
+< #elif CONFIG_TINY_RCU
+< #include <linux/rcutiny.h>
+Seulement dans ./include/linux: rcutiny.h
+diff -r ./include/linux/sched.h ../../Kernel/include/linux/sched.h
+41,46d40
+< #ifdef CONFIG_SCHED_BFS
+< #define SCHED_ISO    4
+< #define SCHED_IDLEPRIO    SCHED_IDLE
+< #define SCHED_MAX    (SCHED_IDLEPRIO)
+< #define SCHED_RANGE(policy)  ((policy) <= SCHED_MAX)
+< #endif
+1229c1223
+< #ifndef CONFIG_SCHED_BFS
+---
+> 
+1235,1237c1229
+< #else /* CONFIG_SCHED_BFS */
+< 	int oncpu;
+< #endif
+---
+> 
+1240,1247d1231
+< #ifdef CONFIG_SCHED_BFS
+< 	int time_slice, first_time_slice;
+< 	unsigned long deadline;
+< 	struct list_head run_list;
+< 	u64 last_ran;
+< 	u64 sched_time; /* sched_clock time spent running */
+< 	unsigned long rt_timeout;
+< #else /* CONFIG_SCHED_BFS */
+1251d1234
+< #endif
+1273,1275c1256
+< #if defined(CONFIG_HOTPLUG_CPU) && defined(CONFIG_SCHED_BFS)
+< 	cpumask_t unplugged_mask;
+< #endif
+---
+> 
+1352,1354d1332
+< #ifdef CONFIG_SCHED_BFS
+< 	unsigned long utime_pc, stime_pc;
+< #endif
+1565,1621d1542
+< #ifdef CONFIG_SCHED_BFS
+< extern int grunqueue_is_locked(void);
+< extern void grq_unlock_wait(void);
+< #define tsk_seruntime(t) ((t)->sched_time)
+< #define tsk_rttimeout(t) ((t)->rt_timeout)
+< #define task_rq_unlock_wait(tsk) grq_unlock_wait()
+< 
+< static inline void set_oom_timeslice(struct task_struct *p)
+< {
+< p->time_slice = HZ;
+< }
+< 
+< static inline void tsk_cpus_current(struct task_struct *p)
+< {
+< }
+< 
+< #define runqueue_is_locked(cpu) grunqueue_is_locked()
+< 
+< static inline void print_scheduler_version(void)
+< {
+< 	printk(KERN_INFO"BFS CPU scheduler v0.318 by Con Kolivas.\n");
+< }
+< 
+< static inline int iso_task(struct task_struct *p)
+< {
+< return (p->policy == SCHED_ISO);
+< }
+< #else
+< extern int runqueue_is_locked(int cpu);
+< extern void task_rq_unlock_wait(struct task_struct *p);
+< #define tsk_seruntime(t) ((t)->se.sum_exec_runtime)
+< #define tsk_rttimeout(t) ((t)->rt.timeout)
+< 
+< static inline void sched_exit(struct task_struct *p)
+< {
+< }
+< 
+< static inline void set_oom_timeslice(struct task_struct *p)
+< {
+< p->rt.time_slice = HZ;
+< }
+< 
+< static inline void tsk_cpus_current(struct task_struct *p)
+< {
+< p->rt.nr_cpus_allowed = current->rt.nr_cpus_allowed;
+< }
+< 
+< static inline void print_scheduler_version(void)
+< {
+< printk(KERN_INFO"CFS CPU scheduler.\n");
+< }
+< 
+< static inline int iso_task(struct task_struct *p)
+< {
+< return 0;
+< }
+< #endif
+1642,1649d1562
+< #ifdef CONFIG_SCHED_BFS
+< #define PRIO_RANGE (40)
+< #define MAX_PRIO (MAX_RT_PRIO + PRIO_RANGE)
+< #define ISO_PRIO (MAX_RT_PRIO)
+< #define NORMAL_PRIO (MAX_RT_PRIO + 1)
+< #define IDLE_PRIO (MAX_RT_PRIO + 2)
+< #define PRIO_LIMIT ((IDLE_PRIO) + 1)
+< #else /* CONFIG_SCHED_BFS */
+1652d1564
+< #endif
+1964c1876
+< #if defined(CONFIG_SMP) && !defined(CONFIG_SCHED_BFS)
+---
+> #ifdef CONFIG_SMP
+2119,2121d2030
+< #ifdef CONFIG_SCHED_BFS
+< extern void sched_exit(struct task_struct *p);
+< #endif
+diff -r ./include/linux/srcu.h ../../Kernel/include/linux/srcu.h
+51d50
+< void synchronize_srcu_expedited(struct srcu_struct *sp);
+diff -r ./include/linux/tick.h ../../Kernel/include/linux/tick.h
+101,103d100
+< #  ifndef arch_needs_cpu
+< #   define arch_needs_cpu(cpu) (0)
+< #  endif
+Seulement dans ./include/linux: utsrelease.h
+Seulement dans ./include/linux: version.h
+diff -r ./include/linux/vmalloc.h ../../Kernel/include/linux/vmalloc.h
+54d53
+< extern void *vzalloc(unsigned long size);
+57d55
+< extern void *vzalloc_node(unsigned long size, int node);
+diff -r ./include/mtd/mtd-abi.h ../../Kernel/include/mtd/mtd-abi.h
+40d39
+< #define MTD_MLCNANDFLASH	8
+Seulement dans ./include/trace/events: asoc.h
+diff -r ./init/Kconfig ../../Kernel/init/Kconfig
+25,36d24
+< config SCHED_BFS
+< 	bool "BFS cpu scheduler"
+< 	---help---
+< 	The Brain Fuck CPU Scheduler for excellent interactivity and
+< 	responsiveness on the desktop and solid scalability on normal
+< 		  hardware. Not recommended for 4096 CPUs.
+< 
+< 	Currently incompatible with the Group CPU scheduler, and RCU TORTURE
+< 		  TEST so these options are disabled.
+< 
+< 		  Say Y here.
+< 	default y
+349,357d336
+< config TINY_RCU
+<   bool "UP-only small-memory-footprint RCU"
+<   depends on !SMP
+<   help
+<     This option selects the RCU implementation that is
+<     designed for UP systems from which real-time response
+<     is not required.  This option greatly reduces the
+<     memory footprint of RCU.
+< 
+452c431
+< 	depends on EXPERIMENTAL && !SCHED_BFS
+---
+> 	depends on EXPERIMENTAL
+568c547
+< 	depends on CGROUPS && !SCHED_BFS
+---
+> 	depends on CGROUPS
+Seulement dans ./init: Kconfig~
+diff -r ./init/main.c ../../Kernel/init/main.c
+814,815d813
+<     print_scheduler_version();
+< 
+diff -r ./kernel/exit.c ../../Kernel/kernel/exit.c
+123c123
+< //		sig->sum_sched_runtime += tsk->se.sum_exec_runtime;
+---
+> 		sig->sum_sched_runtime += tsk->se.sum_exec_runtime;
+diff -r ./kernel/fork.c ../../Kernel/kernel/fork.c
+1258c1258
+< //	p->rt.nr_cpus_allowed = current->rt.nr_cpus_allowed;
+---
+> 	p->rt.nr_cpus_allowed = current->rt.nr_cpus_allowed;
+diff -r ./kernel/freezer.c ../../Kernel/kernel/freezer.c
+107,113c107,108
+< 	    fake_signal_wake_up(p);
+< 	    /*
+< 	     * fake_signal_wake_up() goes through p's scheduler
+< 	     * lock and guarantees that TASK_STOPPED/TRACED ->
+< 	     * TASK_RUNNING transition can't race with task state
+< 	     * testing in try_to_freeze_tasks().
+< 	     */
+---
+> 		if (!signal_pending(p))
+> 			fake_signal_wake_up(p);
+diff -r ./kernel/Makefile ../../Kernel/kernel/Makefile
+85d84
+< obj-$(CONFIG_TINY_RCU) += rcutiny.o
+Seulement dans ./kernel: Makefile~
+diff -r ./kernel/posix-cpu-timers.c ../../Kernel/kernel/posix-cpu-timers.c
+253c253
+< 		times->sum_exec_runtime += tsk_seruntime(t);
+---
+> 		times->sum_exec_runtime += t->se.sum_exec_runtime;
+520c520
+< 		       tsk->utime, tsk->stime, tsk_seruntime(tsk));
+---
+> 		       tsk->utime, tsk->stime, tsk->se.sum_exec_runtime);
+530c530
+< 		       tsk_seruntime(tsk) + sig->sum_sched_runtime);
+---
+> 		       tsk->se.sum_exec_runtime + sig->sum_sched_runtime);
+1023c1023
+< 		if (!--maxfire || tsk_seruntime(tsk) < t->expires.sched) {
+---
+> 		if (!--maxfire || tsk->se.sum_exec_runtime < t->expires.sched) {
+1039c1039
+< 		    tsk_rttimeout(tsk) > DIV_ROUND_UP(hard, USEC_PER_SEC/HZ)) {
+---
+> 		    tsk->rt.timeout > DIV_ROUND_UP(hard, USEC_PER_SEC/HZ)) {
+1047c1047
+< 		if (tsk_rttimeout(tsk) > DIV_ROUND_UP(*soft, USEC_PER_SEC/HZ)) {
+---
+> 		if (tsk->rt.timeout > DIV_ROUND_UP(*soft, USEC_PER_SEC/HZ)) {
+1370c1370
+< 			.sum_exec_runtime = tsk_seruntime(tsk)
+---
+> 			.sum_exec_runtime = tsk->se.sum_exec_runtime
+diff -r ./kernel/power/Kconfig ../../Kernel/kernel/power/Kconfig
+253,260d252
+< config QUICK_WAKEUP
+< 	bool "Quick wakeup"
+< 	depends on SUSPEND
+< 	default n
+< 	---help---
+< 	  Allow kernel driver to do periodic jobs without resuming the full system
+< 	  This option can increase battery life on android powered smartphone.
+< 
+Seulement dans ./kernel/power: Kconfig~
+diff -r ./kernel/power/Makefile ../../Kernel/kernel/power/Makefile
+19d18
+< obj-$(CONFIG_QUICK_WAKEUP)	+= quickwakeup.o
+Seulement dans ./kernel/power: Makefile~
+diff -r ./kernel/power/process.c ../../Kernel/kernel/power/process.c
+61,66d60
+< 			 *
+< 		         * Because freeze_task() goes through p's
+<                          * scheduler lock after setting TIF_FREEZE, it's
+<                          * guaranteed that either we see TASK_RUNNING or
+<                          * try_to_stop() after schedule() in ptrace/signal
+<                          * stop sees TIF_FREEZE.
+Seulement dans ./kernel/power: quickwakeup.c
+diff -r ./kernel/rcupdate.c ../../Kernel/kernel/rcupdate.c
+70,71d69
+< #ifndef CONFIG_TINY_RCU
+< 
+162,163d159
+< #endif /* #ifndef CONFIG_TINY_RCU */
+< 
+192d187
+< 
+Seulement dans ./kernel: rcutiny.c
+diff -r ./kernel/rcutorture.c ../../Kernel/kernel/rcutorture.c
+550,568d549
+< static void srcu_torture_synchronize_expedited(void)
+< {
+<   	synchronize_srcu_expedited(&srcu_ctl);
+< }
+< 
+< static struct rcu_torture_ops srcu_expedited_ops = {
+<   	.init    = srcu_torture_init,
+< 	.cleanup  = srcu_torture_cleanup,
+< 	.readlock  = srcu_torture_read_lock,
+< 	.read_delay  = srcu_read_delay,
+< 	.readunlock  = srcu_torture_read_unlock,
+< 	.completed  = srcu_torture_completed,
+< 	.deferred_free  = rcu_sync_torture_deferred_free,
+< 	.sync    = srcu_torture_synchronize_expedited,
+< 	.cb_barrier  = NULL,
+< 	.stats    = srcu_torture_stats,
+< 	.name    = "srcu_expedited"
+< };
+< 
+614c595
+< static struct rcu_torture_ops sched_sync_ops = {
+---
+> static struct rcu_torture_ops sched_ops_sync = {
+1120,1121c1101,1102
+< 		&srcu_ops, &srcu_expedited_ops,
+< 		&sched_ops, &sched_sync_ops, &sched_expedited_ops, };
+---
+> 		  &sched_expedited_ops,
+> 		  &srcu_ops, &sched_ops, &sched_ops_sync, };
+1132c1113
+<                 printk(KERN_ALERT "rcu-torture: invalid torture type: \"%s\"\n",
+---
+> 		printk(KERN_ALERT "rcutorture: invalid torture type: \"%s\"\n",
+1134,1137d1114
+< 		printk(KERN_ALERT "rcu-torture types:");
+< 		for (i = 0; i < ARRAY_SIZE(torture_ops); i++)
+< 		    printk(KERN_ALERT " %s", torture_ops[i]->name);
+< 		printk(KERN_ALERT "\n");
+Seulement dans ./kernel: sched_bfs 318.c
+Seulement dans ./kernel: sched_bfs.c
+diff -r ./kernel/sched.c ../../Kernel/kernel/sched.c
+1,3d0
+< #ifdef CONFIG_SCHED_BFS
+< #include "sched_bfs.c"
+< #else
+7650d7646
+<         case CPU_STARTING:
+10980,10981d10975
+< EXPORT_SYMBOL_GPL(nr_running);
+< #endif /* CONFIG_SCHED_BFS */
+diff -r ./kernel/srcu.c ../../Kernel/kernel/srcu.c
+52d51
+< EXPORT_SYMBOL_GPL(init_srcu_struct);
+101d99
+< EXPORT_SYMBOL_GPL(cleanup_srcu_struct);
+123d120
+< EXPORT_SYMBOL_GPL(srcu_read_lock);
+142d138
+< EXPORT_SYMBOL_GPL(srcu_read_unlock);
+144,145c140,152
+< /*
+<  * Helper function for synchronize_srcu() and synchronize_srcu_expedited().
+---
+> /**
+>  * synchronize_srcu - wait for prior SRCU read-side critical-section completion
+>  * @sp: srcu_struct with which to synchronize.
+>  *
+>  * Flip the completed counter, and wait for the old count to drain to zero.
+>  * As with classic RCU, the updater must use some separate means of
+>  * synchronizing concurrent updates.  Can block; must be called from
+>  * process context.
+>  *
+>  * Note that it is illegal to call synchornize_srcu() from the corresponding
+>  * SRCU read-side critical section; doing so will result in deadlock.
+>  * However, it is perfectly legal to call synchronize_srcu() on one
+>  * srcu_struct from some other srcu_struct's read-side critical section.
+147c154
+< void __synchronize_srcu(struct srcu_struct *sp, void (*sync_func)(void))
+---
+> void synchronize_srcu(struct srcu_struct *sp)
+169c176,177
+< 	sync_func();  /* Force memory barrier on all CPUs. */
+---
+> 	synchronize_sched();  /* Force memory barrier on all CPUs. */
+> 
+185c193
+< 	sync_func();  /* Force memory barrier on all CPUs. */
+---
+> 	synchronize_sched();  /* Force memory barrier on all CPUs. */
+198c206
+< 	sync_func();  /* Force memory barrier on all CPUs. */
+---
+> 	synchronize_sched();  /* Force memory barrier on all CPUs. */
+232,272d239
+<  * synchronize_srcu - wait for prior SRCU read-side critical-section completion
+<  * @sp: srcu_struct with which to synchronize.
+<  *
+<  * Flip the completed counter, and wait for the old count to drain to zero.
+<  * As with classic RCU, the updater must use some separate means of
+<  * synchronizing concurrent updates.  Can block; must be called from
+<  * process context.
+<  *
+<  * Note that it is illegal to call synchronize_srcu() from the corresponding
+<  * SRCU read-side critical section; doing so will result in deadlock.
+<  * However, it is perfectly legal to call synchronize_srcu() on one
+<  * srcu_struct from some other srcu_struct's read-side critical section.
+<  */
+< void synchronize_srcu(struct srcu_struct *sp)
+< {
+<   __synchronize_srcu(sp, synchronize_sched);
+< }
+< EXPORT_SYMBOL_GPL(synchronize_srcu);
+< 
+< /**
+<  * synchronize_srcu_expedited - like synchronize_srcu, but less patient
+<  * @sp: srcu_struct with which to synchronize.
+<  *
+<  * Flip the completed counter, and wait for the old count to drain to zero.
+<  * As with classic RCU, the updater must use some separate means of
+<  * synchronizing concurrent updates.  Can block; must be called from
+<  * process context.
+<  *
+<  * Note that it is illegal to call synchronize_srcu_expedited()
+<  * from the corresponding SRCU read-side critical section; doing so
+<  * will result in deadlock.  However, it is perfectly legal to call
+<  * synchronize_srcu_expedited() on one srcu_struct from some other
+<  * srcu_struct's read-side critical section.
+<  */
+< void synchronize_srcu_expedited(struct srcu_struct *sp)
+< {
+<   __synchronize_srcu(sp, synchronize_sched_expedited);
+< }
+< EXPORT_SYMBOL_GPL(synchronize_srcu_expedited);
+< 
+< /**
+283a251,256
+> 
+> EXPORT_SYMBOL_GPL(init_srcu_struct);
+> EXPORT_SYMBOL_GPL(cleanup_srcu_struct);
+> EXPORT_SYMBOL_GPL(srcu_read_lock);
+> EXPORT_SYMBOL_GPL(srcu_read_unlock);
+> EXPORT_SYMBOL_GPL(synchronize_srcu);
+diff -r ./kernel/sysctl.c ../../Kernel/kernel/sysctl.c
+110,114d109
+< #ifdef CONFIG_SCHED_BFS
+< extern int rr_interval;
+< extern int sched_iso_cpu;
+< static int __read_mostly five_thousand = 5000;
+< #endif
+252c247
+< #if defined(CONFIG_SCHED_DEBUG) && !defined(CONFIG_SCHED_BFS)
+---
+> #ifdef CONFIG_SCHED_DEBUG
+260d254
+< #ifndef CONFIG_SCHED_BFS
+389d382
+< #endif /* !CONFIG_SCHED_BFS */
+839,862d831
+< 	},
+< #endif
+< #ifdef CONFIG_SCHED_BFS
+< 	{
+< 		.ctl_name	= CTL_UNNUMBERED,
+< 		.procname	= "rr_interval",
+< 		.data		= &rr_interval,
+< 		.maxlen		= sizeof (int),
+< 		.mode		= 0644,
+< 		.proc_handler	= &proc_dointvec_minmax,
+< 		.strategy	= &sysctl_intvec,
+< 		.extra1		= &one,
+< 		.extra2		= &five_thousand,
+< 	},
+< 	{
+< 		.ctl_name	= CTL_UNNUMBERED,
+< 		.procname	= "iso_cpu",
+< 		.data		= &sched_iso_cpu,
+< 		.maxlen		= sizeof (int),
+< 		.mode		= 0644,
+< 		.proc_handler	= &proc_dointvec_minmax,
+< 		.strategy	= &sysctl_intvec,
+< 		.extra1		= &zero,
+< 		.extra2		= &one_hundred,
+diff -r ./kernel/time/tick-sched.c ../../Kernel/kernel/time/tick-sched.c
+296,305c296,297
+<   	if (rcu_needs_cpu(cpu) || printk_needs_cpu(cpu) ||
+<     		arch_needs_cpu(cpu) || this_cpu_load()) {
+<       		next_jiffies = last_jiffies + 1;
+<       		delta_jiffies = 1;
+< 	} else {
+<       		/* Get the next timer wheel timer */
+<       		next_jiffies = get_next_timer_interrupt(last_jiffies);
+<       		delta_jiffies = next_jiffies - last_jiffies;
+<   	}
+< 
+---
+> 	if (rcu_needs_cpu(cpu) || printk_needs_cpu(cpu))
+> 		delta_jiffies = 1;
+Seulement dans ./lib: bsearch.c
+diff -r ./lib/Kconfig.debug ../../Kernel/lib/Kconfig.debug
+721c721
+< 	depends on DEBUG_KERNEL && !SCHED_BFS
+---
+> 	depends on DEBUG_KERNEL
+diff -r ./lib/Makefile ../../Kernel/lib/Makefile
+15,16c15
+< 	 is_single_threaded.o plist.o decompress.o flex_array.o \
+<          memcopy.o bsearch.o
+---
+> 	 is_single_threaded.o plist.o decompress.o flex_array.o
+Seulement dans ./lib: memcopy.c
+diff -r ./lib/string.c ../../Kernel/lib/string.c
+26d25
+< #include <linux/memcopy.h>
+564,565c563,564
+<         unsigned long dstp = (unsigned long)dest;
+<         unsigned long srcp = (unsigned long)src;
+---
+> 	char *tmp = dest;
+> 	const char *s = src;
+567,568c566,567
+<         /* Copy from the beginning to the end */
+<         mem_copy_fwd(dstp, srcp, count);
+---
+> 	while (count--)
+> 		*tmp++ = *s++;
+585,586c584,585
+<         unsigned long dstp = (unsigned long)dest;
+<         unsigned long srcp = (unsigned long)src;
+---
+> 	char *tmp;
+> 	const char *s;
+588,590c587,591
+<         if (dest - src >= count) {
+<         /* Copy from the beginning to the end */
+<                 mem_copy_fwd(dstp, srcp, count);
+---
+> 	if (dest <= src) {
+> 		tmp = dest;
+> 		s = src;
+> 		while (count--)
+> 			*tmp++ = *s++;
+592,593c593,598
+<         /* Copy from the end to the beginning */
+<                 mem_copy_bwd(dstp, srcp, count);
+---
+> 		tmp = dest;
+> 		tmp += count;
+> 		s = src;
+> 		s += count;
+> 		while (count--)
+> 			*--tmp = *--s;
+diff -r ./Makefile ../../Kernel/Makefile
+184,188c184
+< #CROSS_COMPILE   := /opt/ds5/bin/arm-none-linux-gnueabi-
+< #CROSS_COMPILE   := /opt/toolchains/arm-2010q1/bin/arm-none-eabi-
+< #CROSS_COMPILE   := /home/desktop/Bureau/Work/toolchains/arm-2011.03/bin/arm-none-eabi-
+< CROSS_COMPILE   := /home/desktop/toolchains/arm-eabi-4.4.3/bin/arm-eabi-
+< #CROSS_COMPILE    := arm-linux-gnueabi-
+---
+> CROSS_COMPILE   := /opt/toolchains/arm-2009q3/bin/arm-none-linux-gnueabi-
+228,229c224,225
+< HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -O3 -fomit-frame-pointer
+< HOSTCXXFLAGS = -O3
+---
+> HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -O2 -fomit-frame-pointer
+> HOSTCXXFLAGS = -O2
+330c326
+< MODFLAGS	= -DMODULE -O3 -marm -mfpu=vfp -mtune=arm1176jzf-s
+---
+> MODFLAGS	= -DMODULE
+334c330
+< CFLAGS_KERNEL	= 
+---
+> CFLAGS_KERNEL	=
+351d346
+< 		   -marm \
+353,386c348
+< 		   -fno-delete-null-pointer-checks \
+<                    -fsingle-precision-constant \
+< #                        -mcpu=arm1176jzf-s \
+< 			-mtune=arm1176jzf-s \
+<                         -march=armv6tej \
+<                         -ffast-math \
+< 			-mthumb-interwork \
+<                         -pipe \
+<                         -mthumb \
+<                         -mfloat-abi=hard \
+< 			-funsafe-math-optimizations \
+< 			-ffinite-math-only \
+< 			-fgcse-las \
+< 			-fgcse-sm \
+< 			-ftree-loop-linear \
+< 			-ftree-loop-im \
+< 			-ftree-loop-ivcanon \
+< 			-fivopts \
+< 			-funroll-loops \
+< 			-fbtr-bb-exclusive \
+< 			-fremove-local-statics \
+< 			-fvect-cost-mode \			
+< #                        -fno-gcse \
+<                         -mfpu=vfp \
+<                         -fno-tree-vectorize \
+<                         -fprefetch-loop-arrays \
+<                         -fmodulo-sched -fmodulo-sched-allow-regmoves \
+<                         -funswitch-loops -fpredictive-commoning -fgcse-after-reload \
+<                                 --param l2-cache-size=128 \
+<                                 --param l1-cache-size=32 \
+<                                 --param simultaneous-prefetches=8 \
+<                                 --param prefetch-latency=400 \
+<                                 --param l1-cache-line-size=64
+< 
+---
+> 		   -fno-delete-null-pointer-checks
+564c526
+< KBUILD_CFLAGS	+= -O2 -fno-reorder-blocks -fno-tree-ch 
+---
+> KBUILD_CFLAGS	+= -O2
+601,603d562
+< 
+< # improve gcc optimization 
+< CFLAGS += $(call cc-option,-funit-at-a-time,) 
+diff -r ./mm/ashmem.c ../../Kernel/mm/ashmem.c
+181c181
+< 	ret = generic_file_open(inode, file);
+---
+> 	ret = nonseekable_open(inode, file);
+202,203c202
+< 	if (!mutex_trylock(&ashmem_mutex))
+< 		return -1;
+---
+> 	mutex_lock(&ashmem_mutex);
+215,222d213
+< static inline unsigned long
+< calc_vm_may_flags(unsigned long prot)
+< {
+< 	return _calc_vm_trans(prot, PROT_READ,  VM_MAYREAD ) |
+< 	       _calc_vm_trans(prot, PROT_WRITE, VM_MAYWRITE) |
+< 	       _calc_vm_trans(prot, PROT_EXEC,  VM_MAYEXEC);
+< }
+< 
+242,247d232
+< 	if (ret < 0) {
+< 		goto out;
+< 	}
+< 
+< 	/** Update backing file pos, since f_ops->read() doesn't */
+< 	asma->file->f_pos = *pos;
+254c239,240
+< static loff_t ashmem_llseek(struct file *file, loff_t offset, int origin)
+---
+> static inline unsigned long
+> calc_vm_may_flags(unsigned long prot)
+256,281c242,244
+< 	struct ashmem_area *asma = file->private_data;
+< 	int ret;
+< 
+< 	mutex_lock(&ashmem_mutex);
+< 
+< 	if (asma->size == 0) {
+< 		ret = -EINVAL;
+< 		goto out;
+< 	}
+< 
+< 	if (!asma->file) {
+< 		ret = -EBADF;
+< 		goto out;
+< 	}
+< 
+< 	ret = asma->file->f_op->llseek(asma->file, offset, origin);
+< 	if (ret < 0) {
+< 		goto out;
+< 	}
+< 
+< 	/** Copy f_pos from backing file, since f_ops->llseek() sets it */
+< 	file->f_pos = asma->file->f_pos;
+< 
+< out:
+< 	mutex_unlock(&ashmem_mutex);
+< 	return ret;
+---
+> 	return _calc_vm_trans(prot, PROT_READ,  VM_MAYREAD ) |
+> 	       _calc_vm_trans(prot, PROT_WRITE, VM_MAYWRITE) |
+> 	       _calc_vm_trans(prot, PROT_EXEC,  VM_MAYEXEC);
+351c314
+< static int ashmem_shrink(struct shrinker *s, int nr_to_scan, gfp_t gfp_mask)
+---
+> static int ashmem_shrink(int nr_to_scan, gfp_t gfp_mask)
+361,362c324
+< 	if (!mutex_trylock(&ashmem_mutex))
+< 		return -1;
+---
+> 	mutex_lock(&ashmem_mutex);
+667,668c629,630
+< 			ret = ashmem_shrink(&ashmem_shrinker, 0, GFP_KERNEL);
+< 			ashmem_shrink(&ashmem_shrinker, ret, GFP_KERNEL);
+---
+> 			ret = ashmem_shrink(0, GFP_KERNEL);
+> 			ashmem_shrink(ret, GFP_KERNEL);
+680,681c642
+<         .read = ashmem_read,
+<         .llseek = ashmem_llseek,
+---
+> 	.read = ashmem_read,
+diff -r ./mm/migrate.c ../../Kernel/mm/migrate.c
+297a298
+> 	page_unfreeze_refs(page, expected_count);
+299c300
+< 	 * Drop cache reference from old page by unfreezing.
+---
+> 	 * Drop cache reference from old page.
+302c303,304
+< 	page_unfreeze_refs(page, expected_count - 1);
+---
+> 	__put_page(page);
+> 
+diff -r ./mm/oom_kill.c ../../Kernel/mm/oom_kill.c
+368c368
+< //	p->rt.time_slice = HZ;
+---
+> 	p->rt.time_slice = HZ;
+diff -r ./mm/swapfile.c ../../Kernel/mm/swapfile.c
+580d579
+<                 struct gendisk *disk = p->bdev->bd_disk;
+589,590d587
+<                 if (disk->fops->swap_slot_free_notify)
+<                    disk->fops->swap_slot_free_notify(p->bdev, offset);
+diff -r ./mm/vmalloc.c ../../Kernel/mm/vmalloc.c
+1586,1592d1585
+< static inline void *__vmalloc_node_flags(unsigned long size,
+<           int node, gfp_t flags)
+< {
+<   return __vmalloc_node(size, 1, flags, PAGE_KERNEL,
+<           node, __builtin_return_address(0));
+< }
+< 
+1610,1626d1602
+<  *  vzalloc - allocate virtually contiguous memory with zero fill
+<  *  @size:  allocation size
+<  *  Allocate enough pages to cover @size from the page level
+<  *  allocator and map them into contiguous kernel virtual space.
+<  *  The memory allocated is set to zero.
+<  *
+<  *  For tight control over page level allocator and protection flags
+<  *  use __vmalloc() instead.
+<  */
+< void *vzalloc(unsigned long size)
+< {
+<   return __vmalloc_node_flags(size, -1,
+<         GFP_KERNEL | __GFP_HIGHMEM | __GFP_ZERO);
+< }
+< EXPORT_SYMBOL(vzalloc);
+< 
+< /**
+1666,1684d1641
+< 
+< /**
+<  * vzalloc_node - allocate memory on a specific node with zero fill
+<  * @size:  allocation size
+<  * @node:  numa node
+<  *
+<  * Allocate enough pages to cover @size from the page level
+<  * allocator and map them into contiguous kernel virtual space.
+<  * The memory allocated is set to zero.
+<  *
+<  * For tight control over page level allocator and protection flags
+<  * use __vmalloc_node() instead.
+<  */
+< void *vzalloc_node(unsigned long size, int node)
+< {
+<   return __vmalloc_node_flags(size, node,
+<        GFP_KERNEL | __GFP_HIGHMEM | __GFP_ZERO);
+< }
+< EXPORT_SYMBOL(vzalloc_node);
+diff -r ./mm/vmscan.c ../../Kernel/mm/vmscan.c
+39d38
+< #include <linux/timer.h>
+2135,2137d2133
+< #define WT_EXPIRY  (HZ * 5)  /* Time to wakeup watermark_timer */
+< 
+< 
+2187,2189d2182
+< 		/* kswapd has been busy so delay watermark_timer */
+< 		mod_timer(&pgdat->watermark_timer, jiffies + WT_EXPIRY);
+< 
+2446,2473d2438
+<  * We wake up kswapd every WT_EXPIRY till free ram is above pages_lots
+<  */
+< static void watermark_wakeup(unsigned long data)
+< {
+<   pg_data_t *pgdat = (pg_data_t *)data;
+<   struct timer_list *wt = &pgdat->watermark_timer;
+<   int i;
+< 
+<   if (!waitqueue_active(&pgdat->kswapd_wait))
+<     goto out;
+<   for (i = pgdat->nr_zones - 1; i >= 0; i--) {
+<     struct zone *z = pgdat->node_zones + i;
+< 
+<     if (!populated_zone(z) || is_highmem(z)) {
+<       /* We are better off leaving highmem full */
+<       continue;
+<     }
+<     if (!zone_watermark_ok(z, 0, lots_wmark_pages(z), 0, 0)) {
+<       wake_up_interruptible(&pgdat->kswapd_wait);
+<       goto out;
+<     }
+<   }
+< out:
+<   mod_timer(wt, jiffies + WT_EXPIRY);
+<   return;
+< }
+< 
+< /*
+2480d2444
+< 	struct timer_list *wt;
+2486,2492d2449
+< 	wt = &pgdat->watermark_timer;
+< 	init_timer(wt);
+< 	wt->data = (unsigned long)pgdat;
+< 	wt->function = watermark_wakeup;
+< 	wt->expires = jiffies + WT_EXPIRY;
+< 	add_timer(wt);
+< 
+2496d2452
+<                 del_timer(wt);
+Seulement dans ./modules: bcm4329
+Seulement dans ./modules/fm_si4709: Module.symvers
+Seulement dans ./modules/fm_si4709: .tmp_versions
+Seulement dans .: Module.symvers
+diff -r ./net/ipv4/tcp_cong.c ../../Kernel/net/ipv4/tcp_cong.c
+198c198
+< 	char *saved_clone, *clone, *name;
+---
+> 	char *clone, *name;
+201c201
+<         saved_clone = clone = kstrdup(val, GFP_USER);
+---
+> 	clone = kstrdup(val, GFP_USER);
+228c228
+<         kfree(saved_clone);
+---
+> 
+Seulement dans ./scripts/basic: docproc
+Seulement dans ./scripts/basic: fixdep
+Seulement dans ./scripts/basic: hash
+Seulement dans ./scripts: bin2c
+Seulement dans ./scripts: conmakehash
+Seulement dans ./scripts: kallsyms
+Seulement dans ./scripts/kconfig: conf
+Seulement dans ./scripts/kconfig: lex.zconf.c
+Seulement dans ./scripts/kconfig: mconf
+Seulement dans ./scripts/kconfig: zconf.hash.c
+Seulement dans ./scripts/kconfig: zconf.tab.c
+Seulement dans ./scripts/mod: elfconfig.h
+Seulement dans ./scripts/mod: mk_elfconfig
+Seulement dans ./scripts/mod: modpost
+diff -r ./sound/soc/codecs/Kconfig ../../Kernel/sound/soc/codecs/Kconfig
+227,287d226
+< 
+< menuconfig SND_WM8994_EXTENSIONS
+< 	bool "WM8994 Extensions"
+< 	depends on SND_APOLLO_WM8994
+< 	default y
+< 	help
+< 	  With this option enabled, the kernel compile an additional driver
+< 	  that extend the existing sound driver
+< 
+< config SND_WM8994_EXTENSIONS_HP_LEVEL_CONTROL
+< 	bool "Add headphone amplifier level control"
+< 	depends on SND_WM8994_EXTENSIONS
+< 	default y
+< 	help
+< 	  Adds a control allowing to adjust the analog gain of the headphone
+< 	  amplifier
+< 
+< config SND_WM8994_EXTENSIONS_HP_LEVEL
+< 	int "default level at boot 0-62"
+< 	depends on SND_WM8994_EXTENSIONS_HP_LEVEL_CONTROL
+< 	default 54 if MACH_HERRING=y || M110S=y
+<         default 62 if MACH_APOLLO=y
+< 	default 47
+< 	range 0 62
+< 	help
+< 	  Default headphone amplifier level. Take care not setting it to high,
+< 	  it would introduce hiss for people not using the control app
+< 
+< config SND_WM8994_EXTENSIONS_RECORD_PRESETS
+< 	bool "Microphone recording presets"
+< 	depends on SND_WM8994_EXTENSIONS
+< 	default y
+< 	help
+< 	  Recording presets with Dynamic Range Compression auto-gain
+< 	  on microphone:
+< 	    - Original
+< 	    - High sensitivity
+< 	    - Balanced (recommanded, default)
+< 	    - Loud environment - concert
+< 
+< config SND_WM8994_EXTENSIONS_FM
+< 	bool "FM radio: frequency response and levels optimizations"
+< 	depends on SND_WM8994_EXTENSIONS && (SAMSUNG_GALAXYS || SAMSUNG_GALAXYSB)
+< 	default y
+< 	help
+< 	  Adds a control to enable or disable the high-pass filter on FM radio
+< 
+< config SND_WM8994_EXTENSIONS_MODULE
+< 	tristate "Build also as module (incomplete)"
+< 	depends on SND_WM8994_EXTENSIONS && m && n
+< 	default n
+< 	help
+< 	  requires additional source
+< 
+< config SND_WM8994_EXTENSIONS_DEVELOPMENT
+< 	bool "Codec development tools (unsafe)"
+< 	depends on SND_WM8994_EXTENSIONS
+< 	default n
+< 	help
+< 	  Allow to codec dump registers and load register-address/value batches
+< 	  Powerful but also dangerous tool
+Seulement dans ./sound/soc/codecs: Kconfig~
+diff -r ./sound/soc/codecs/Makefile ../../Kernel/sound/soc/codecs/Makefile
+34,36d33
+< ifeq ($(CONFIG_SND_WM8994_EXTENSIONS),y)
+< snd-soc-wm8994-objs := wm8994.o wm8994_apollo.o wm8994_gain.o wm8994_extensions.o
+< else
+38d34
+< endif
+Seulement dans ./sound/soc/codecs: Makefile~
+diff -r ./sound/soc/codecs/wm8994_apollo.c ../../Kernel/sound/soc/codecs/wm8994_apollo.c
+14,17d13
+< #ifdef CONFIG_SND_WM8994_EXTENSIONS
+< #include "wm8994_extensions.h"
+< #endif
+< 
+494,497d489
+< #ifdef CONFIG_SND_WM8994_EXTENSIONS
+< 	wm8994_extensions_playback_speaker();
+< #endif
+< 
+1456,1459d1447
+< #endif
+< 
+< #ifdef CONFIG_SND_WM8994_EXTENSIONS_RECORD_PRESETS
+< 	wm8994_extensions_record_main_mic();
+diff -r ./sound/soc/codecs/wm8994.c ../../Kernel/sound/soc/codecs/wm8994.c
+40,41d39
+< #include "wm8994.h"
+< #include "wm8994_gain.h"
+43,45c41,42
+< #ifdef CONFIG_SND_WM8994_EXTENSIONS
+< #include "wm8994_extensions.h"
+< #endif
+---
+> #include "wm8994_def.h"
+> #include "wm8994_gain.h"
+126a124,138
+> struct wm8994_priv {
+> 	u16 reg_cache[WM8994_REGISTER_COUNT];
+> 	//struct wm8993_platform_data pdata;
+> 	struct snd_soc_codec codec;
+> 	int master;
+> 	int sysclk_source;
+> 	unsigned int mclk_rate;
+> 	unsigned int sysclk_rate;
+> 	unsigned int fs;
+> 	unsigned int bclk;
+> 	int class_w_users;
+> 	unsigned int fll_fref;
+> 	unsigned int fll_fout;
+> };
+> 
+292,296c304,306
+< 
+< #ifdef CONFIG_SND_WM8994_EXTENSIONS
+< 	value = wm8994_extensions_write(codec, reg, value);
+< #endif
+< 
+---
+> 	//BUG_ON(reg > WM8993_MAX_REGISTER);
+> 	if(wm8994_debug_on) // For Debugging wm8994 setting
+> 		printk(KERN_ERR "[WM8994] wm8994_write : reg (0x%x) - val (0x%x)\n", reg, value);
+498,499d507
+< 	struct wm8994_priv *wm8994 = codec->private_data;
+< 
+515d522
+< 
+517d523
+< 				wm8994->cur_path = new_path;
+1696,1697d1701
+< 	wm8994->power_state = CODEC_ON;
+< 
+1752,1755d1755
+< 
+< #ifdef CONFIG_SND_WM8994_EXTENSIONS
+< 	wm8994_extensions_pcm_probe(codec);
+< #endif
+1828d1827
+< 		wm8994->power_state = CODEC_OFF;
+1841d1839
+< 	struct wm8994_priv *wm8994 = codec->private_data;
+1847,1849d1844
+< 		wm8994->power_state = CODEC_ON;
+< 	    wm8994_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+< 	    wm8994_enable_path(codec, wm8994_curr_path);
+1851,1853c1846,1847
+< 
+< //	wm8994_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+< //	wm8994_enable_path(codec, wm8994_curr_path);
+---
+> 	wm8994_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+> 	wm8994_enable_path(codec, wm8994_curr_path);
+diff -r ./sound/soc/codecs/wm8994_def.h ../../Kernel/sound/soc/codecs/wm8994_def.h
+17c17
+< unsigned int wm8994_read(struct snd_soc_codec *codec,unsigned int reg);
+---
+> inline unsigned int wm8994_read(struct snd_soc_codec *codec,unsigned int reg);
+Seulement dans ./sound/soc/codecs: wm8994_extensions.c
+Seulement dans ./sound/soc/codecs: wm8994_extensions.h
+Seulement dans ./sound/soc/codecs: wm8994.h
+Seulement dans .: .version
